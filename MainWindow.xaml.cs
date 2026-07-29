@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Microsoft.Win32;
 using WindowMonitor.Capture;
@@ -22,6 +23,12 @@ public partial class MainWindow : Window
     private readonly TemplateMatcher _matcher = new();
     private MonitorWindow? _monitor;
     private long _frameCount;
+
+    /// <summary>
+    /// 目前擷取對象的顯示名稱。狀態列只有一格主訊息，擷取狀態（「擷取中」「目標視窗已關閉」）
+    /// 本身不帶視窗資訊，所以在這裡記著，顯示時接上去。
+    /// </summary>
+    private string? _targetLabel;
 
     public MainWindow()
     {
@@ -52,13 +59,28 @@ public partial class MainWindow : Window
         HoverOpacityCombo.SelectedIndex = 0;
     }
 
+    /// <summary>
+    /// 狀態列主訊息。錯誤用紅字，下一則正常訊息會自動還原顏色。
+    ///
+    /// 這一格會截斷（視窗標題經常過長），所以 ToolTip 一律掛完整內容；
+    /// details 則用在載入錯誤這種多行、放不進一行的細節。
+    /// </summary>
+    private void SetStatus(string message, bool isError = false, string? details = null)
+    {
+        StatusMessageText.Text = message;
+        StatusMessageText.Foreground = isError
+            ? (Brush)FindResource("ErrorBrush")
+            : SystemColors.ControlTextBrush;
+        StatusMessageText.ToolTip = details ?? message;
+    }
+
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
 
         if (!GraphicsCaptureSource.IsSupported())
         {
-            StatusText.Text = "這台電腦不支援 Windows.Graphics.Capture，無法擷取畫面。";
+            SetStatus("這台電腦不支援 Windows.Graphics.Capture，無法擷取畫面。", isError: true);
             StartButton.IsEnabled = false;
             RefreshButton.IsEnabled = false;
             return;
@@ -105,7 +127,7 @@ public partial class MainWindow : Window
             WindowList.SelectedItem = windows.FirstOrDefault(w => w.Handle == previous.Handle);
         }
 
-        FooterText.Text = $"找到 {windows.Count} 個可擷取的視窗。";
+        SetStatus($"找到 {windows.Count} 個可擷取的視窗。");
     }
 
     private void OnRefreshClick(object sender, RoutedEventArgs e) => RefreshWindowList();
@@ -124,13 +146,13 @@ public partial class MainWindow : Window
     {
         if (WindowList.SelectedItem is not WindowInfo target)
         {
-            StatusText.Text = "請先從清單選擇一個目標視窗。";
+            SetStatus("請先從清單選擇一個目標視窗。", isError: true);
             return;
         }
 
         if (!NativeMethods.IsWindow(target.Handle))
         {
-            StatusText.Text = "這個視窗已經關閉了，請重新整理清單。";
+            SetStatus("這個視窗已經關閉了，請重新整理清單。", isError: true);
             return;
         }
 
@@ -142,21 +164,26 @@ public partial class MainWindow : Window
             _matcher.ForgetPositions();
             _matcher.ClearResults();
 
+            _targetLabel = target.Display;
+
             _source.IntervalMilliseconds = ParseInterval();
             _source.Start(target.Handle);
 
             StartButton.IsEnabled = false;
             StopButton.IsEnabled = true;
-            FooterText.Text = $"正在擷取：{target.Display}";
         }
         catch (Exception ex)
         {
-            StatusText.Text = $"啟動擷取失敗：{ex.Message}";
+            _targetLabel = null;
+            SetStatus($"啟動擷取失敗：{ex.Message}", isError: true);
         }
     }
 
     private void OnStopClick(object sender, RoutedEventArgs e)
     {
+        // 先清掉，Stop() 觸發的「已停止」才不會又接上視窗名稱
+        _targetLabel = null;
+
         _source.Stop();
         _matcher.ForgetPositions();
         _matcher.ClearResults();
@@ -195,18 +222,24 @@ public partial class MainWindow : Window
         // 事件來自擷取執行緒
         Dispatcher.InvokeAsync(() =>
         {
-            StatusText.Text = e.Message;
+            string? label = _targetLabel;
 
             if (e.State is CaptureState.TargetClosed or CaptureState.Failed)
             {
                 StartButton.IsEnabled = true;
                 StopButton.IsEnabled = false;
+                _targetLabel = null;
 
                 if (e.State == CaptureState.TargetClosed)
                 {
                     RefreshWindowList();
                 }
             }
+
+            // 放在重新整理之後：兩者共用狀態列，這則訊息比「找到 N 個視窗」重要
+            SetStatus(
+                label is null ? e.Message : $"{e.Message} · {label}",
+                e.State == CaptureState.Failed);
         });
     }
 
@@ -219,7 +252,7 @@ public partial class MainWindow : Window
 
         Dispatcher.InvokeAsync(() =>
         {
-            FrameInfoText.Text = $"{width} × {height}　已擷取 {count} 幀　最後更新 {timestamp:HH:mm:ss}";
+            FrameInfoText.Text = $"{width} × {height} · {count} 幀 · {timestamp:HH:mm:ss}";
             UpdateMatchStatus();
         });
     }
@@ -284,23 +317,22 @@ public partial class MainWindow : Window
     {
         TemplateLibrary library = _matcher.Library;
 
+        // 路徑在版面上會被截斷，完整值只能靠 ToolTip 看
         TemplateFolderText.Text = library.FolderPath;
+        TemplateFolderText.ToolTip = library.FolderPath;
+
         TemplateList.ItemsSource = library.Snapshot();
 
         IReadOnlyList<string> errors = library.LoadErrors;
         if (errors.Count > 0)
         {
-            TemplateErrorText.Text = string.Join(Environment.NewLine, errors);
-            TemplateErrorText.Visibility = Visibility.Visible;
-        }
-        else
-        {
-            TemplateErrorText.Visibility = Visibility.Collapsed;
+            SetStatus(
+                $"{errors.Count} 個樣板載入失敗",
+                isError: true,
+                details: string.Join(Environment.NewLine, errors));
         }
 
-        MatchStatusText.Text = library.Count == 0
-            ? "尚未載入任何樣板。把 PNG 放進資料夾後按「重新載入」。"
-            : $"已載入 {library.Count} 個樣板。";
+        UpdateMatchStatus();
     }
 
     private void ReloadTemplates()
@@ -374,13 +406,15 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            MatchStatusText.Text = $"無法開啟資料夾：{ex.Message}";
+            SetStatus($"無法開啟資料夾：{ex.Message}", isError: true);
         }
     }
 
     /// <summary>
     /// 比對耗時是判斷「要不要調大擷取間隔」的依據，所以每幀都更新。
     /// 比對在擷取執行緒上跑，耗時逼近間隔就代表擷取頻率已經被拖慢了。
+    ///
+    /// 這裡寫的是狀態列最右格，一行放得下才行，較長的說明一律移到 ToolTip。
     /// </summary>
     private void UpdateMatchStatus()
     {
@@ -388,22 +422,28 @@ public partial class MainWindow : Window
 
         if (count == 0)
         {
-            MatchStatusText.Text = "尚未載入任何樣板。把 PNG 放進資料夾後按「重新載入」。";
+            MatchInfoText.Text = "尚無樣板";
+            MatchInfoText.ToolTip = "把 PNG 放進樣板資料夾後按「重新載入」。";
             return;
         }
 
         if (!_matcher.IsEnabled)
         {
-            MatchStatusText.Text = $"已載入 {count} 個樣板（比對未啟用）。";
+            MatchInfoText.Text = $"{count} 樣板（未啟用）";
+            MatchInfoText.ToolTip = null;
             return;
         }
 
-        string detail = _matcher.LastError is null
-            ? $"比對耗時 {_matcher.LastElapsedMilliseconds:F1} ms" +
-              $"（局部 {_matcher.LastLocalSearchCount}／全圖 {_matcher.LastFullSearchCount}）"
-            : $"比對發生錯誤：{_matcher.LastError}";
+        if (_matcher.LastError is not null)
+        {
+            MatchInfoText.Text = $"{count} 樣板 · 比對錯誤";
+            MatchInfoText.ToolTip = _matcher.LastError;
+            return;
+        }
 
-        MatchStatusText.Text = $"已載入 {count} 個樣板　{detail}";
+        MatchInfoText.Text = $"{count} 樣板 · {_matcher.LastElapsedMilliseconds:F1} ms" +
+                             $"（局部 {_matcher.LastLocalSearchCount}／全圖 {_matcher.LastFullSearchCount}）";
+        MatchInfoText.ToolTip = null;
     }
 
     private void OnMatchEnabledChanged(object sender, RoutedEventArgs e)
@@ -449,7 +489,7 @@ public partial class MainWindow : Window
     {
         if (!_source.Frames.TryCopyLatest(out FrameData frame))
         {
-            StatusText.Text = "還沒有可儲存的畫面。";
+            SetStatus("還沒有可儲存的畫面。", isError: true);
             return;
         }
 
@@ -482,11 +522,11 @@ public partial class MainWindow : Window
             using FileStream stream = File.Create(dialog.FileName);
             encoder.Save(stream);
 
-            StatusText.Text = $"已儲存：{dialog.FileName}";
+            SetStatus($"已儲存：{dialog.FileName}");
         }
         catch (Exception ex)
         {
-            StatusText.Text = $"儲存失敗：{ex.Message}";
+            SetStatus($"儲存失敗：{ex.Message}", isError: true);
         }
     }
 
