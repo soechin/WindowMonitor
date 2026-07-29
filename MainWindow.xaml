@@ -2,8 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WindowMonitor — 設定"
-        Height="640" Width="460"
-        MinHeight="560" MinWidth="420">
+        Height="880" Width="460"
+        MinHeight="700" MinWidth="420">
 
     <Window.Resources>
         <Style TargetType="GroupBox">
@@ -25,6 +25,7 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <!-- 目標視窗 -->
@@ -35,8 +36,11 @@
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
+                <!-- MinHeight 是必要的：下面幾個區塊都是 Auto 高，
+                     少了下限的話這一列會被擠到只剩一兩行 -->
                 <ListBox x:Name="WindowList"
                          Grid.Row="0"
+                         MinHeight="150"
                          DisplayMemberPath="Display"
                          MouseDoubleClick="OnWindowListDoubleClick" />
 
@@ -80,8 +84,75 @@
             </StackPanel>
         </GroupBox>
 
+        <!-- 樣板比對 -->
+        <GroupBox Grid.Row="2" Header="樣板比對">
+            <StackPanel>
+                <TextBlock x:Name="TemplateFolderText"
+                           Text="—"
+                           Foreground="#FF666666"
+                           TextTrimming="CharacterEllipsis" />
+
+                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                    <Button Content="選擇資料夾" Click="OnChooseTemplateFolderClick" MinWidth="90" />
+                    <Button Content="重新載入" Click="OnReloadTemplatesClick" Margin="8,0,0,0" />
+                    <Button Content="開啟資料夾" Click="OnOpenTemplateFolderClick" Margin="8,0,0,0" MinWidth="90" />
+                </StackPanel>
+
+                <CheckBox x:Name="MatchEnabledCheck"
+                          Content="啟用比對"
+                          Margin="0,8,0,4"
+                          Checked="OnMatchEnabledChanged"
+                          Unchecked="OnMatchEnabledChanged" />
+
+                <CheckBox x:Name="LocalSearchCheck"
+                          Content="命中後只在附近搜尋"
+                          IsChecked="True"
+                          Checked="OnLocalSearchChanged"
+                          Unchecked="OnLocalSearchChanged" />
+                <TextBlock Text="大幅省下比對時間。目標會在畫面中大範圍移動時可以關閉。"
+                           Foreground="#FF666666"
+                           Margin="20,0,0,6"
+                           TextWrapping="Wrap" />
+
+                <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                    <TextBlock Text="門檻" VerticalAlignment="Center" Margin="0,0,8,0" />
+                    <Slider x:Name="ThresholdSlider"
+                            Width="200"
+                            Minimum="0.50" Maximum="0.99"
+                            Value="0.80"
+                            TickFrequency="0.05"
+                            TickPlacement="BottomRight"
+                            VerticalAlignment="Center"
+                            ValueChanged="OnThresholdChanged" />
+                    <TextBlock x:Name="ThresholdText"
+                               Text="0.80"
+                               VerticalAlignment="Center"
+                               Margin="8,0,0,0" />
+                </StackPanel>
+
+                <!-- 唯讀清單，只是讓使用者知道載到了什麼 -->
+                <ListBox x:Name="TemplateList"
+                         Height="76"
+                         Margin="0,8,0,0"
+                         DisplayMemberPath="Display"
+                         Focusable="False" />
+
+                <TextBlock x:Name="TemplateErrorText"
+                           Foreground="#FFCC3333"
+                           Margin="0,4,0,0"
+                           TextWrapping="Wrap"
+                           Visibility="Collapsed" />
+
+                <TextBlock x:Name="MatchStatusText"
+                           Text="—"
+                           Foreground="#FF666666"
+                           Margin="0,4,0,0"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+        </GroupBox>
+
         <!-- 監控視窗 -->
-        <GroupBox Grid.Row="2" Header="監控視窗">
+        <GroupBox Grid.Row="3" Header="監控視窗">
             <StackPanel>
                 <CheckBox x:Name="ClickThroughCheck"
                           Content="點擊穿透"
@@ -115,7 +186,7 @@
             </StackPanel>
         </GroupBox>
 
-        <TextBlock Grid.Row="3"
+        <TextBlock Grid.Row="4"
                    x:Name="FooterText"
                    Foreground="#FF666666"
                    TextWrapping="Wrap" />

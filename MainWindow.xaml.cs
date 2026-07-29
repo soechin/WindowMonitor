@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -7,6 +8,7 @@ using System.Windows.Media.Imaging;
 using Microsoft.Win32;
 using WindowMonitor.Capture;
 using WindowMonitor.Interop;
+using WindowMonitor.Matching;
 using WindowMonitor.Models;
 
 namespace WindowMonitor;
@@ -17,6 +19,7 @@ public partial class MainWindow : Window
     private static readonly int[] HoverOpacityLevels = [60, 40, 25, 10];
 
     private readonly GraphicsCaptureSource _source = new();
+    private readonly TemplateMatcher _matcher = new();
     private MonitorWindow? _monitor;
     private long _frameCount;
 
@@ -26,6 +29,9 @@ public partial class MainWindow : Window
 
         _source.StateChanged += OnCaptureStateChanged;
         _source.FrameCaptured += OnFrameCaptured;
+
+        // 比對就掛在擷取事件上，跟著擷取執行緒同步跑
+        _matcher.Attach(_source);
 
         InitializeOpacityOptions();
     }
@@ -60,6 +66,7 @@ public partial class MainWindow : Window
 
         RefreshWindowList();
         ShowMonitorWindow();
+        InitializeTemplates();
     }
 
     private void ShowMonitorWindow()
@@ -67,6 +74,7 @@ public partial class MainWindow : Window
         _monitor = new MonitorWindow(_source)
         {
             Owner = null,
+            Matcher = _matcher,
             ClickThrough = ClickThroughCheck.IsChecked == true,
             FadeOnHover = FadeOnHoverCheck.IsChecked == true,
             OpacityPercent = OpacityLevels[Math.Max(OpacityCombo.SelectedIndex, 0)],
@@ -129,6 +137,11 @@ public partial class MainWindow : Window
         try
         {
             _frameCount = 0;
+
+            // 換了目標視窗，舊畫面的命中位置不能再沿用
+            _matcher.ForgetPositions();
+            _matcher.ClearResults();
+
             _source.IntervalMilliseconds = ParseInterval();
             _source.Start(target.Handle);
 
@@ -145,6 +158,9 @@ public partial class MainWindow : Window
     private void OnStopClick(object sender, RoutedEventArgs e)
     {
         _source.Stop();
+        _matcher.ForgetPositions();
+        _matcher.ClearResults();
+
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;
     }
@@ -204,6 +220,7 @@ public partial class MainWindow : Window
         Dispatcher.InvokeAsync(() =>
         {
             FrameInfoText.Text = $"{width} × {height}　已擷取 {count} 幀　最後更新 {timestamp:HH:mm:ss}";
+            UpdateMatchStatus();
         });
     }
 
@@ -242,6 +259,186 @@ public partial class MainWindow : Window
     private void OnResetPositionClick(object sender, RoutedEventArgs e)
     {
         _monitor?.PositionAtBottomRight();
+    }
+
+    // ── 樣板比對 ────────────────────────────────────────────
+
+    private void InitializeTemplates()
+    {
+        _matcher.Threshold = ThresholdSlider.Value;
+        _matcher.UseLocalSearch = LocalSearchCheck.IsChecked == true;
+        _matcher.IsEnabled = MatchEnabledCheck.IsChecked == true;
+
+        ThresholdText.Text = _matcher.Threshold.ToString("F2");
+
+        // 預設資料夾不存在不算錯誤，只是還沒有樣板可用
+        if (_matcher.Library.FolderExists)
+        {
+            _matcher.Library.Reload();
+        }
+
+        UpdateTemplateUi();
+    }
+
+    private void UpdateTemplateUi()
+    {
+        TemplateLibrary library = _matcher.Library;
+
+        TemplateFolderText.Text = library.FolderPath;
+        TemplateList.ItemsSource = library.Snapshot();
+
+        IReadOnlyList<string> errors = library.LoadErrors;
+        if (errors.Count > 0)
+        {
+            TemplateErrorText.Text = string.Join(Environment.NewLine, errors);
+            TemplateErrorText.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            TemplateErrorText.Visibility = Visibility.Collapsed;
+        }
+
+        MatchStatusText.Text = library.Count == 0
+            ? "尚未載入任何樣板。把 PNG 放進資料夾後按「重新載入」。"
+            : $"已載入 {library.Count} 個樣板。";
+    }
+
+    private void ReloadTemplates()
+    {
+        _matcher.Library.Reload();
+
+        // 樣板換了，之前記住的命中位置就不能再用
+        _matcher.ForgetPositions();
+        _matcher.ClearResults();
+
+        UpdateTemplateUi();
+        RematchLatestFrame();
+    }
+
+    /// <summary>
+    /// 立刻用手上最新的一幀重跑一次比對。
+    ///
+    /// WGC 只在畫面內容變化時才產生新幀，遊戲暫停或停在選單時可能好幾秒都沒有下一幀。
+    /// 少了這一步，使用者調門檻、換樣板、勾選啟用之後會覺得設定「沒有反應」。
+    /// </summary>
+    private void RematchLatestFrame()
+    {
+        if (!_matcher.IsEnabled)
+        {
+            return;
+        }
+
+        // 這裡是 UI 執行緒，擷取執行緒可能同時在覆寫 front buffer，所以取複本
+        if (_source.Frames.TryCopyLatest(out FrameData frame))
+        {
+            _matcher.MatchFrame(frame);
+        }
+
+        UpdateMatchStatus();
+    }
+
+    private void OnReloadTemplatesClick(object sender, RoutedEventArgs e) => ReloadTemplates();
+
+    private void OnChooseTemplateFolderClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Title = "選擇樣板資料夾"
+        };
+
+        if (_matcher.Library.FolderExists)
+        {
+            dialog.InitialDirectory = _matcher.Library.FolderPath;
+        }
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        _matcher.Library.SetFolder(dialog.FolderName);
+        ReloadTemplates();
+    }
+
+    private void OnOpenTemplateFolderClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            _matcher.Library.EnsureFolder();
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = _matcher.Library.FolderPath,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            MatchStatusText.Text = $"無法開啟資料夾：{ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// 比對耗時是判斷「要不要調大擷取間隔」的依據，所以每幀都更新。
+    /// 比對在擷取執行緒上跑，耗時逼近間隔就代表擷取頻率已經被拖慢了。
+    /// </summary>
+    private void UpdateMatchStatus()
+    {
+        int count = _matcher.Library.Count;
+
+        if (count == 0)
+        {
+            MatchStatusText.Text = "尚未載入任何樣板。把 PNG 放進資料夾後按「重新載入」。";
+            return;
+        }
+
+        if (!_matcher.IsEnabled)
+        {
+            MatchStatusText.Text = $"已載入 {count} 個樣板（比對未啟用）。";
+            return;
+        }
+
+        string detail = _matcher.LastError is null
+            ? $"比對耗時 {_matcher.LastElapsedMilliseconds:F1} ms" +
+              $"（局部 {_matcher.LastLocalSearchCount}／全圖 {_matcher.LastFullSearchCount}）"
+            : $"比對發生錯誤：{_matcher.LastError}";
+
+        MatchStatusText.Text = $"已載入 {count} 個樣板　{detail}";
+    }
+
+    private void OnMatchEnabledChanged(object sender, RoutedEventArgs e)
+    {
+        _matcher.IsEnabled = MatchEnabledCheck.IsChecked == true;
+
+        if (_matcher.IsEnabled)
+        {
+            RematchLatestFrame();
+            return;
+        }
+
+        _matcher.ForgetPositions();
+        _matcher.ClearResults();
+        UpdateMatchStatus();
+    }
+
+    private void OnLocalSearchChanged(object sender, RoutedEventArgs e)
+    {
+        _matcher.UseLocalSearch = LocalSearchCheck.IsChecked == true;
+        RematchLatestFrame();
+    }
+
+    private void OnThresholdChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        _matcher.Threshold = e.NewValue;
+
+        // 這個事件在 InitializeComponent 期間就會觸發，那時控制項還沒建好
+        if (ThresholdText is null)
+        {
+            return;
+        }
+
+        ThresholdText.Text = e.NewValue.ToString("F2");
+        RematchLatestFrame();
     }
 
     /// <summary>
@@ -302,7 +499,9 @@ public partial class MainWindow : Window
         _monitor?.Close();
         _monitor = null;
 
+        // 擷取先停下來，才不會有執行緒還在碰比對用的 Mat
         _source.Dispose();
+        _matcher.Dispose();
 
         base.OnClosed(e);
     }

@@ -24,6 +24,10 @@
   <ItemGroup>
     <PackageReference Include="Vortice.Direct3D11" Version="3.6.2" />
     <PackageReference Include="Vortice.DXGI" Version="3.6.2" />
+
+    <!-- runtime.win 提供 x64 原生 OpenCvSharpExtern.dll，與本專案固定的 x64 相符 -->
+    <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260627" />
+    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.13.0.20260627" />
   </ItemGroup>
 
 </Project>
