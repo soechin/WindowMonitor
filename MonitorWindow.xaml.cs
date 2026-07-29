@@ -27,10 +27,19 @@ public partial class MonitorWindow : Window
     /// <summary>視窗邊緣可用來縮放的寬度（DIP）。</summary>
     private const double ResizeBorderThickness = 8;
 
-    /// <summary>命中標籤的高度（DIP），用來決定標籤放在框上方還是框內。</summary>
+    /// <summary>命中標籤的高度（DIP），用來讓標籤對齊點的垂直中心。</summary>
     private const double MarkerLabelHeight = 15;
 
-    private static readonly Brush MarkerStroke = CreateFrozenBrush(Color.FromRgb(0x3F, 0xE0, 0x7C));
+    /// <summary>命中點標記的直徑（DIP）。</summary>
+    private const double MarkerDotSize = 7;
+
+    /// <summary>警告紅框閃爍一個完整週期所需的輪詢次數（約 0.7 秒）。</summary>
+    private const int AlertPulseTicks = 12;
+
+    private const double AlertMinOpacity = 0.2;
+    private const double AlertMaxOpacity = 1.0;
+
+    private static readonly Brush MarkerBrush = CreateFrozenBrush(Color.FromRgb(0x3F, 0xE0, 0x7C));
     private static readonly Brush MarkerLabelBackground =
         CreateFrozenBrush(Color.FromArgb(0xC8, 0x10, 0x10, 0x10));
 
@@ -43,6 +52,12 @@ public partial class MonitorWindow : Window
 
     /// <summary>上次畫進 Overlay 的結果版本。−1 代表「下次一定重畫」。</summary>
     private long _overlayResultId = -1;
+
+    /// <summary>目前是否有命中，決定警告紅框要不要亮。</summary>
+    private bool _alertActive;
+
+    /// <summary>閃爍的相位，每輪詢一次進一格。</summary>
+    private int _alertPhase;
 
     /// <summary>由擷取執行緒設定、UI 執行緒的計時器讀取。</summary>
     private volatile bool _pendingFrame;
@@ -225,6 +240,7 @@ public partial class MonitorWindow : Window
         }
 
         UpdateOverlay();
+        StepAlert();
         UpdateHoverState();
         StepOpacity();
     }
@@ -270,6 +286,11 @@ public partial class MonitorWindow : Window
         }
 
         matcher.TryGetResults(out IReadOnlyList<MatchResult> results, out long resultId);
+
+        // 警告狀態必須在下面兩個早退之前就決定好，
+        // 否則「結果沒變」或「版面還沒算出來」的那幾格紅框不會更新。
+        _alertActive = results.Count > 0;
+
         if (resultId == _overlayResultId)
         {
             return;
@@ -309,33 +330,34 @@ public partial class MonitorWindow : Window
 
     private void AddMarker(MatchResult hit, double scale, double offsetX, double offsetY)
     {
-        double x = offsetX + (hit.X * scale);
-        double y = offsetY + (hit.Y * scale);
+        // 「有沒有命中」由整個視窗的警告紅框表達，這裡只標出「命中在哪裡」。
+        // hit.X／hit.Y 是命中區域的左上角，要加半個寬高才是中心。
+        double centerX = offsetX + ((hit.X + (hit.Width / 2.0)) * scale);
+        double centerY = offsetY + ((hit.Y + (hit.Height / 2.0)) * scale);
 
-        var box = new Rectangle
+        var dot = new Ellipse
         {
-            Width = hit.Width * scale,
-            Height = hit.Height * scale,
-            Stroke = MarkerStroke,
-            StrokeThickness = 1.5
+            Width = MarkerDotSize,
+            Height = MarkerDotSize,
+            Fill = MarkerBrush
         };
 
-        Canvas.SetLeft(box, x);
-        Canvas.SetTop(box, y);
-        Overlay.Children.Add(box);
+        Canvas.SetLeft(dot, centerX - (MarkerDotSize / 2));
+        Canvas.SetTop(dot, centerY - (MarkerDotSize / 2));
+        Overlay.Children.Add(dot);
 
-        // 分數畫在框上。主視窗沒有結果清單，這是唯一能回饋門檻是否合適的地方。
+        // 分數畫在點旁邊。主視窗沒有結果清單，這是唯一能回饋門檻是否合適的地方。
         var label = new TextBlock
         {
             Text = $"{hit.TemplateName} {hit.Score:F2}",
-            Foreground = MarkerStroke,
+            Foreground = MarkerBrush,
             Background = MarkerLabelBackground,
             FontSize = 11,
             Padding = new Thickness(3, 0, 3, 0)
         };
 
-        Canvas.SetLeft(label, x);
-        Canvas.SetTop(label, y >= MarkerLabelHeight ? y - MarkerLabelHeight : y);
+        Canvas.SetLeft(label, centerX + (MarkerDotSize / 2) + 2);
+        Canvas.SetTop(label, centerY - (MarkerLabelHeight / 2));
         Overlay.Children.Add(label);
     }
 
@@ -347,6 +369,37 @@ public partial class MonitorWindow : Window
         }
 
         _overlayResultId = -1;
+        _alertActive = false;
+    }
+
+    /// <summary>
+    /// 命中期間讓警告紅框週期性明暗變化。刻意不動 Window.Opacity——
+    /// 那個每次輪詢都被 StepOpacity 覆寫，兩邊會打架。
+    /// </summary>
+    private void StepAlert()
+    {
+        if (!_alertActive)
+        {
+            if (AlertBorder.Visibility != Visibility.Collapsed)
+            {
+                AlertBorder.Visibility = Visibility.Collapsed;
+            }
+
+            // 下次命中從最亮開始，第一眼就看得到
+            _alertPhase = 0;
+            return;
+        }
+
+        if (AlertBorder.Visibility != Visibility.Visible)
+        {
+            AlertBorder.Visibility = Visibility.Visible;
+        }
+
+        // cos 波：相位 0 最亮，走到半週期最暗，再平滑回到最亮
+        double wave = (1 + Math.Cos(_alertPhase / (double)AlertPulseTicks * 2 * Math.PI)) / 2;
+        AlertBorder.Opacity = AlertMinOpacity + ((AlertMaxOpacity - AlertMinOpacity) * wave);
+
+        _alertPhase = (_alertPhase + 1) % AlertPulseTicks;
     }
 
     /// <summary>

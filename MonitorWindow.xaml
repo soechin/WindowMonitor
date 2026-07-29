@@ -25,7 +25,7 @@
                    Stretch="Uniform"
                    RenderOptions.BitmapScalingMode="HighQuality" />
 
-            <!-- 預留給之後的 template matching：命中位置的標示會畫在這裡 -->
+            <!-- template matching 命中位置的點標記畫在這裡 -->
             <Canvas x:Name="Overlay" IsHitTestVisible="False" />
 
             <TextBlock x:Name="PlaceholderText"
@@ -34,6 +34,13 @@
                        FontSize="13"
                        HorizontalAlignment="Center"
                        VerticalAlignment="Center" />
+
+            <!-- 命中時的警告框，透明度由 StepAlert 逐格控制 -->
+            <Border x:Name="AlertBorder"
+                    BorderBrush="#FFFF3B30"
+                    BorderThickness="3"
+                    IsHitTestVisible="False"
+                    Visibility="Collapsed" />
         </Grid>
     </Border>
 </Window>
