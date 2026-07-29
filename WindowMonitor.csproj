@@ -19,6 +19,13 @@
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!--
+      預設輸出路徑會依 $(Platform) 與 TFM 再分層，導致直接建置 csproj（Platform=AnyCPU）
+      與透過 slnx 建置（Platform=x64）落在不同資料夾。本專案只有單一 TFM 與單一平台，
+      關掉這兩層讓輸出固定在 bin\<Configuration>\。
+    -->
+    <AppendPlatformToOutputPath>false</AppendPlatformToOutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
