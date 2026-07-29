@@ -1,0 +1,39 @@
+<Window x:Class="WindowMonitor.MonitorWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="WindowMonitor"
+        Width="480" Height="270"
+        MinWidth="120" MinHeight="80"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ResizeMode="CanResize"
+        Background="#FF101010"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        MouseLeftButtonDown="OnMouseLeftButtonDown">
+
+    <!--
+        刻意保持極簡：沒有標題列、沒有按鈕，整個 client 區就是畫面本身。
+        所有設定都在主視窗，這裡不放任何控制項。
+        1px 邊框只用來界定範圍。
+    -->
+    <Border BorderBrush="#FF3C3C3C" BorderThickness="1">
+        <Grid>
+            <Image x:Name="FrameImage"
+                   Stretch="Uniform"
+                   RenderOptions.BitmapScalingMode="HighQuality" />
+
+            <!-- 預留給之後的 template matching：命中位置的標示會畫在這裡 -->
+            <Canvas x:Name="Overlay" IsHitTestVisible="False" />
+
+            <TextBlock x:Name="PlaceholderText"
+                       Text="尚未開始擷取"
+                       Foreground="#FF808080"
+                       FontSize="13"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center" />
+        </Grid>
+    </Border>
+</Window>

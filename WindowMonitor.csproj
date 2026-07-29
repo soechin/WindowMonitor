@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!--
+      TFM 需帶 Windows 版本才會啟用 WinRT 投影，Windows.Graphics.Capture 才可用。
+      用 22621 是為了在編譯期看得到 GraphicsCaptureSession.IsBorderRequired
+      （關閉黃色擷取邊框）與 GraphicsCaptureAccess，這兩者是 Windows 11 才加入的。
+      實際最低執行版本由 SupportedOSPlatformVersion 決定，程式內以 ApiInformation
+      檢查後才呼叫，因此在較舊的系統上仍可執行、只是保留黃框。
+    -->
+    <TargetFramework>net10.0-windows10.0.22621.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- staging texture 讀回時以指標逐列複製 -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Vortice.Direct3D11" Version="3.6.2" />
+    <PackageReference Include="Vortice.DXGI" Version="3.6.2" />
+  </ItemGroup>
+
+</Project>
