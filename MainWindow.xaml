@@ -71,7 +71,7 @@
 
             <!-- 目標視窗 -->
             <GroupBox Grid.Row="0" Header="目標視窗"
-                      ToolTip="遊戲建議使用「無邊框視窗」模式，雙擊項目可直接開始擷取">
+                      ToolTip="遊戲建議使用「無邊框視窗」模式，雙擊項目可直接開始擷取；擷取中要換目標請先按「停止」">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*" />

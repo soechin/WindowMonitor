@@ -169,14 +169,29 @@ public partial class MainWindow : Window
             _source.IntervalMilliseconds = ParseInterval();
             _source.Start(target.Handle);
 
-            StartButton.IsEnabled = false;
-            StopButton.IsEnabled = true;
+            SetCaptureUiState(true);
         }
         catch (Exception ex)
         {
             _targetLabel = null;
+
+            // Start() 失敗時擷取並沒有跑起來，UI 不能停在「擷取中」的樣子，
+            // 否則清單也跟著解不開
+            SetCaptureUiState(false);
             SetStatus($"啟動擷取失敗：{ex.Message}", isError: true);
         }
+    }
+
+    /// <summary>
+    /// 擷取中／非擷取中的 UI 狀態。清單一併鎖住——擷取期間選取必須等於擷取目標，
+    /// 否則高亮會與狀態列的目標名稱對不起來，停止後再開始也會換到別的視窗。
+    /// </summary>
+    private void SetCaptureUiState(bool capturing)
+    {
+        StartButton.IsEnabled = !capturing;
+        StopButton.IsEnabled = capturing;
+        WindowList.IsEnabled = !capturing;
+        RefreshButton.IsEnabled = !capturing;
     }
 
     private void OnStopClick(object sender, RoutedEventArgs e)
@@ -188,8 +203,7 @@ public partial class MainWindow : Window
         _matcher.ForgetPositions();
         _matcher.ClearResults();
 
-        StartButton.IsEnabled = true;
-        StopButton.IsEnabled = false;
+        SetCaptureUiState(false);
     }
 
     private int ParseInterval()
@@ -226,8 +240,7 @@ public partial class MainWindow : Window
 
             if (e.State is CaptureState.TargetClosed or CaptureState.Failed)
             {
-                StartButton.IsEnabled = true;
-                StopButton.IsEnabled = false;
+                SetCaptureUiState(false);
                 _targetLabel = null;
 
                 if (e.State == CaptureState.TargetClosed)
