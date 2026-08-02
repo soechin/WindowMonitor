@@ -10,6 +10,7 @@ using System.Windows.Threading;
 using WindowMonitor.Capture;
 using WindowMonitor.Interop;
 using WindowMonitor.Matching;
+using WindowMonitor.Settings;
 
 namespace WindowMonitor;
 
@@ -106,6 +107,18 @@ public partial class MonitorWindow : Window
     /// </summary>
     public TemplateMatcher? Matcher { get; set; }
 
+    /// <summary>
+    /// 由主視窗在 Show() 之前注入，開啟時要還原的位置與大小（DIP）。
+    /// null 或內容無效時改用右下角。
+    /// </summary>
+    public WindowPlacement? RestorePlacement { get; set; }
+
+    /// <summary>取得目前的位置與大小，供主視窗寫進設定檔。</summary>
+    public WindowPlacement GetPlacement()
+    {
+        return new WindowPlacement { Left = Left, Top = Top, Width = Width, Height = Height };
+    }
+
     private static Brush CreateFrozenBrush(Color color)
     {
         var brush = new SolidColorBrush(color);
@@ -179,8 +192,33 @@ public partial class MonitorWindow : Window
         ContentLayer.Opacity = TargetOpacity;
         ApplyClickThrough();
 
-        PositionAtBottomRight();
+        ApplyRestorePlacement();
         _timer.Start();
+    }
+
+    /// <summary>
+    /// 套用上次關閉時的位置與大小。必須在 AddHook 之後呼叫——螢幕數量或解析度變了以後
+    /// 記錄的位置可能落在畫面外，要靠 <see cref="HandleWindowPosChanging"/> 夾回來；
+    /// 尺寸的上下限同樣由那裡的 <see cref="FitToLimits"/> 收尾。
+    ///
+    /// 此時 _aspectRatio 還是 0（尚未收到影格），所以還原的尺寸不會被比例改寫；
+    /// 第一幀進來時 <see cref="ApplyAspectRatio"/> 會保持面積、只調形狀。
+    /// </summary>
+    private void ApplyRestorePlacement()
+    {
+        WindowPlacement? placement = RestorePlacement;
+
+        if (placement is null || !placement.IsUsable)
+        {
+            PositionAtBottomRight();
+            return;
+        }
+
+        // 先尺寸再位置：反過來的話設定尺寸會把右下角推出螢幕，位置又要再夾一次
+        Width = placement.Width;
+        Height = placement.Height;
+        Left = placement.Left;
+        Top = placement.Top;
     }
 
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)

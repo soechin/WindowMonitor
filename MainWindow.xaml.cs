@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
@@ -11,6 +12,7 @@ using WindowMonitor.Capture;
 using WindowMonitor.Interop;
 using WindowMonitor.Matching;
 using WindowMonitor.Models;
+using WindowMonitor.Settings;
 
 namespace WindowMonitor;
 
@@ -19,8 +21,13 @@ public partial class MainWindow : Window
     private static readonly int[] OpacityLevels = [100, 80, 60, 40];
     private static readonly int[] HoverOpacityLevels = [60, 40, 25, 10];
 
+    private const int MinIntervalMilliseconds = 50;
+    private const int MaxIntervalMilliseconds = 60_000;
+    private const int DefaultIntervalMilliseconds = 1000;
+
     private readonly GraphicsCaptureSource _source = new();
     private readonly TemplateMatcher _matcher = new();
+    private readonly AppSettings _settings = SettingsStore.Load();
     private MonitorWindow? _monitor;
     private long _frameCount;
 
@@ -41,6 +48,57 @@ public partial class MainWindow : Window
         _matcher.Attach(_source);
 
         InitializeOpacityOptions();
+
+        // 必須在 InitializeOpacityOptions 之後：兩個下拉選單的項目要先填好才選得了檔位
+        ApplySettings();
+    }
+
+    /// <summary>
+    /// 把設定檔的內容寫回控制項。這裡刻意只碰控制項，不直接推給 _source／_matcher／_monitor——
+    /// OnSourceInitialized 之後的 ShowMonitorWindow() 與 InitializeTemplates() 本來就會
+    /// 從控制項讀值去初始化那三者，重複一次只會多一份會走樣的邏輯。
+    ///
+    /// 設定值一律夾回控制項本身的合法範圍，設定檔被手改壞也不會讓 UI 進到不合理的狀態。
+    /// </summary>
+    private void ApplySettings()
+    {
+        int interval = Math.Clamp(
+            _settings.IntervalMilliseconds,
+            MinIntervalMilliseconds,
+            MaxIntervalMilliseconds);
+
+        IntervalBox.Text = interval.ToString();
+        _source.IntervalMilliseconds = interval;
+
+        // 樣板資料夾沒有對應的控制項，資料本身就在 Library 上
+        if (!string.IsNullOrWhiteSpace(_settings.TemplateFolder))
+        {
+            _matcher.Library.SetFolder(_settings.TemplateFolder);
+        }
+
+        MatchEnabledCheck.IsChecked = _settings.MatchEnabled;
+        LocalSearchCheck.IsChecked = _settings.UseLocalSearch;
+        ThresholdSlider.Value = Math.Clamp(
+            _settings.Threshold,
+            ThresholdSlider.Minimum,
+            ThresholdSlider.Maximum);
+
+        ClickThroughCheck.IsChecked = _settings.ClickThrough;
+        FadeOnHoverCheck.IsChecked = _settings.FadeOnHover;
+
+        SelectOpacityLevel(OpacityCombo, OpacityLevels, _settings.OpacityPercent);
+        SelectOpacityLevel(HoverOpacityCombo, HoverOpacityLevels, _settings.HoverOpacityPercent);
+    }
+
+    /// <summary>設定檔存的是百分比值，找不到對應檔位（陣列改過或值被改壞）就維持原選擇。</summary>
+    private static void SelectOpacityLevel(ComboBox combo, int[] levels, int percent)
+    {
+        int index = Array.IndexOf(levels, percent);
+
+        if (index >= 0)
+        {
+            combo.SelectedIndex = index;
+        }
     }
 
     private void InitializeOpacityOptions()
@@ -97,6 +155,7 @@ public partial class MainWindow : Window
         {
             Owner = null,
             Matcher = _matcher,
+            RestorePlacement = _settings.MonitorPlacement,
             ClickThrough = ClickThroughCheck.IsChecked == true,
             FadeOnHover = FadeOnHoverCheck.IsChecked == true,
             OpacityPercent = OpacityLevels[Math.Max(OpacityCombo.SelectedIndex, 0)],
@@ -210,10 +269,10 @@ public partial class MainWindow : Window
     {
         if (int.TryParse(IntervalBox.Text, out int value))
         {
-            return Math.Clamp(value, 50, 60_000);
+            return Math.Clamp(value, MinIntervalMilliseconds, MaxIntervalMilliseconds);
         }
 
-        return 1000;
+        return DefaultIntervalMilliseconds;
     }
 
     private void OnIntervalChanged(object sender, RoutedEventArgs e)
@@ -543,6 +602,64 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             SetStatus($"儲存失敗：{ex.Message}", isError: true);
+        }
+    }
+
+    /// <summary>
+    /// 存檔放在這裡而不是 OnClosed：後者第一件事就是關掉監控視窗，那之後讀不到它的位置。
+    /// 而且此時視窗還在，存檔失敗才有地方報。
+    /// </summary>
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        base.OnClosing(e);
+
+        if (e.Cancel)
+        {
+            return;
+        }
+
+        CollectSettings();
+
+        try
+        {
+            SettingsStore.Save(_settings);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 安裝在唯讀目錄（例如 Program Files）時會寫不進去。安靜失敗會讓人以為
+            // 記住設定的功能壞了，所以寧可跳一次警告——但不擋住關閉。
+            MessageBox.Show(
+                this,
+                $"設定無法儲存：{ex.Message}{Environment.NewLine}{SettingsStore.FilePath}",
+                "WindowMonitor",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
+    private void CollectSettings()
+    {
+        _settings.IntervalMilliseconds = ParseInterval();
+
+        // 預設資料夾不寫進設定檔：它是從執行檔位置算出來的，存成絕對路徑的話
+        // 整個資料夾搬家之後就會指回舊位置。
+        _settings.TemplateFolder = _matcher.Library.IsDefaultFolder
+            ? null
+            : _matcher.Library.FolderPath;
+
+        _settings.MatchEnabled = MatchEnabledCheck.IsChecked == true;
+        _settings.UseLocalSearch = LocalSearchCheck.IsChecked == true;
+        _settings.Threshold = ThresholdSlider.Value;
+
+        _settings.ClickThrough = ClickThroughCheck.IsChecked == true;
+        _settings.FadeOnHover = FadeOnHoverCheck.IsChecked == true;
+        _settings.OpacityPercent = OpacityLevels[Math.Max(OpacityCombo.SelectedIndex, 0)];
+        _settings.HoverOpacityPercent = HoverOpacityLevels[Math.Max(HoverOpacityCombo.SelectedIndex, 0)];
+
+        // 監控視窗沒開起來過（例如這台電腦不支援擷取）就保留載入時的記錄，不要清掉
+        if (_monitor is not null)
+        {
+            _settings.MonitorPlacement = _monitor.GetPlacement();
         }
     }
 

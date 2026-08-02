@@ -11,6 +11,9 @@ public sealed class TemplateLibrary : IDisposable
 {
     private static readonly string[] SupportedExtensions = [".png", ".jpg", ".jpeg", ".bmp"];
 
+    /// <summary>沒有另行指定時使用的資料夾，位置跟著執行檔走。</summary>
+    public static readonly string DefaultFolderPath = Path.Combine(AppContext.BaseDirectory, "Templates");
+
     private readonly Lock _sync = new();
 
     private TemplateItem[] _items = [];
@@ -18,10 +21,13 @@ public sealed class TemplateLibrary : IDisposable
 
     public TemplateLibrary()
     {
-        FolderPath = Path.Combine(AppContext.BaseDirectory, "Templates");
+        FolderPath = DefaultFolderPath;
     }
 
     public string FolderPath { get; private set; }
+
+    public bool IsDefaultFolder =>
+        string.Equals(FolderPath, DefaultFolderPath, StringComparison.OrdinalIgnoreCase);
 
     public int Count
     {
