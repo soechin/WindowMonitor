@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Vortice.Direct3D11;
 using Windows.Foundation.Metadata;
 using Windows.Graphics;
@@ -20,12 +21,19 @@ public sealed class GraphicsCaptureSource : IFrameSource
     private const DirectXPixelFormat CaptureFormat = DirectXPixelFormat.B8G8R8A8UIntNormalized;
 
     /// <summary>
-    /// frame pool 的緩衝數。因為是低頻主動取樣而非逐幀處理，2 個就夠。
+    /// frame pool 的緩衝數。因為是低頻主動取樣而非逐幀處理，2 個就夠——
+    /// 但前提是每輪取樣都會把池子排空，見 <see cref="AcquireFreshFrame"/>。
     /// </summary>
     private const int BufferCount = 2;
 
     /// <summary>連續這麼久都沒有新畫面，才視為目標沒在呈現。</summary>
     private const int StaleThresholdMilliseconds = 3000;
+
+    /// <summary>
+    /// 排空池子後等待新幀的上限。約三個 60 Hz 更新週期，
+    /// 目標若真的在動早就等到了；等不到就是畫面靜止，不值得再耗下去。
+    /// </summary>
+    private const int FreshFrameTimeoutMilliseconds = 50;
 
     /// <summary>保護底下那些欄位。只在極短的區段內持有。</summary>
     private readonly Lock _sync = new();
@@ -35,6 +43,12 @@ public sealed class GraphicsCaptureSource : IFrameSource
     /// 這一把要橫跨「等待擷取迴圈退出」的整段時間，不能讓另一邊趁隙插進來建新 session。
     /// </summary>
     private readonly Lock _lifecycle = new();
+
+    /// <summary>
+    /// WGC 把新畫面放進池子時觸發。只用來喚醒擷取迴圈，不代表我們會逐幀處理：
+    /// 池子填滿後 WGC 就停止產生，一個取樣週期內大約只會觸發 BufferCount 次。
+    /// </summary>
+    private readonly ManualResetEventSlim _frameSignal = new(false);
 
     private D3D11Helper? _d3d;
     private IDirect3DDevice? _device;
@@ -139,12 +153,14 @@ public sealed class GraphicsCaptureSource : IFrameSource
                         CaptureFormat,
                         BufferCount,
                         _poolSize);
+                    _framePool.FrameArrived += OnFrameArrived;
 
                     _session = _framePool.CreateCaptureSession(_item);
                     ConfigureSession(_session);
                     _session.StartCapture();
 
                     Frames.Clear();
+                    _frameSignal.Reset();
                     _emptyFrameStreak = 0;
 
                     _cancellation = new CancellationTokenSource();
@@ -207,11 +223,11 @@ public sealed class GraphicsCaptureSource : IFrameSource
         try
         {
             // 先立即抓一次，不必等第一個間隔過去
-            CaptureOnce();
+            CaptureOnce(token);
 
             while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
             {
-                CaptureOnce();
+                CaptureOnce(token);
             }
         }
         catch (OperationCanceledException)
@@ -228,7 +244,7 @@ public sealed class GraphicsCaptureSource : IFrameSource
         }
     }
 
-    private void CaptureOnce()
+    private void CaptureOnce(CancellationToken token)
     {
         Direct3D11CaptureFramePool? framePool = _framePool;
         D3D11Helper? d3d = _d3d;
@@ -245,7 +261,7 @@ public sealed class GraphicsCaptureSource : IFrameSource
             return;
         }
 
-        using Direct3D11CaptureFrame? frame = framePool.TryGetNextFrame();
+        using Direct3D11CaptureFrame? frame = AcquireFreshFrame(framePool, token);
         if (frame is null)
         {
             // 沒有新幀不等於出問題：WGC 只在內容變化時產生幀，畫面靜止
@@ -280,10 +296,68 @@ public sealed class GraphicsCaptureSource : IFrameSource
 
         FrameData buffer = Frames.AcquireWriteBuffer(contentSize.Width, contentSize.Height);
         d3d.CopyToFrame(texture, buffer);
-        FrameData published = Frames.Publish();
+        FrameData published = Frames.Publish(MeasureAge(frame));
 
         SetState(CaptureState.Running, "擷取中");
         FrameCaptured?.Invoke(this, published);
+    }
+
+    /// <summary>
+    /// 取得一張盡可能新的畫面。
+    ///
+    /// frame pool 是先進先出的佇列，<see cref="Direct3D11CaptureFramePool.TryGetNextFrame"/>
+    /// 給的是最舊的那張；而池子一滿，WGC 就不再產生新畫面。低頻取樣時若每輪只取走一張，
+    /// 佇列就永遠是滿的，拿到的像素會固定舊上約 BufferCount 個取樣間隔——1 FPS 時就是兩秒。
+    ///
+    /// 所以每輪先把積壓全部倒掉（buffer 還給 WGC，它才會繼續產生），再等一張真正的新幀。
+    /// 這不等於逐幀處理：昂貴的讀回與比對仍然每輪只做一次，這裡多出來的成本就是
+    /// 幾次 TryGetNextFrame 與一次等待。
+    /// </summary>
+    private Direct3D11CaptureFrame? AcquireFreshFrame(
+        Direct3D11CaptureFramePool framePool,
+        CancellationToken token)
+    {
+        // 先 Reset 再排空：排空期間抵達的新幀會把訊號留著，不會漏掉喚醒
+        _frameSignal.Reset();
+
+        // 積壓的都是舊畫面，只留最後一張當備援，
+        // 免得更新率低於取樣率的目標整輪落空。
+        Direct3D11CaptureFrame? frame = null;
+        while (framePool.TryGetNextFrame() is { } stale)
+        {
+            frame?.Dispose();
+            frame = stale;
+        }
+
+        // 逾時也照樣再撈一次：訊號可能在 Reset 之前就觸發過，那張其實已經在佇列裡了
+        _frameSignal.Wait(FreshFrameTimeoutMilliseconds, token);
+
+        if (framePool.TryGetNextFrame() is { } fresh)
+        {
+            frame?.Dispose();
+            frame = fresh;
+        }
+
+        return frame;
+    }
+
+    private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
+    {
+        // 只喚醒擷取迴圈。這個回呼跑在 WGC 的執行緒上，不能在這裡做任何實質工作。
+        _frameSignal.Set();
+    }
+
+    /// <summary>
+    /// 這張畫面從被擷取到現在過了多久。
+    /// SystemRelativeTime 與 <see cref="Stopwatch"/> 同為 QPC 時基，可以直接相減。
+    /// </summary>
+    private static TimeSpan MeasureAge(Direct3D11CaptureFrame frame)
+    {
+        TimeSpan now = TimeSpan.FromSeconds((double)Stopwatch.GetTimestamp() / Stopwatch.Frequency);
+        TimeSpan age = now - frame.SystemRelativeTime;
+
+        // 時基理應一致，但真要對不上也不該回報負數
+        return age > TimeSpan.Zero ? age : TimeSpan.Zero;
     }
 
     private void OnItemClosed(GraphicsCaptureItem sender, object args)
@@ -400,8 +474,12 @@ public sealed class GraphicsCaptureSource : IFrameSource
         _session?.Dispose();
         _session = null;
 
-        _framePool?.Dispose();
-        _framePool = null;
+        if (_framePool is not null)
+        {
+            _framePool.FrameArrived -= OnFrameArrived;
+            _framePool.Dispose();
+            _framePool = null;
+        }
 
         if (_item is not null)
         {
@@ -420,6 +498,8 @@ public sealed class GraphicsCaptureSource : IFrameSource
 
     public void Dispose()
     {
+        // Stop 會等擷取迴圈退出，之後才沒人會再碰 _frameSignal
         Stop();
+        _frameSignal.Dispose();
     }
 }

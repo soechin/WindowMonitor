@@ -17,6 +17,12 @@ public sealed class FrameData
 
     public DateTime Timestamp { get; internal set; }
 
+    /// <summary>
+    /// 這張畫面從被擷取到取出時已經過了多久。<see cref="Timestamp"/> 記的是取出的時刻，
+    /// 看不出擷取管線本身積壓了多少，實際延遲要看這個。
+    /// </summary>
+    public TimeSpan CaptureAge { get; internal set; }
+
     public long FrameId { get; internal set; }
 
     public bool IsEmpty => Width == 0 || Height == 0;
@@ -57,11 +63,12 @@ public sealed class FrameBuffer
     }
 
     /// <summary>擷取端完成寫入後呼叫，交換 front／back 並回傳新的最新幀。</summary>
-    internal FrameData Publish()
+    internal FrameData Publish(TimeSpan captureAge)
     {
         lock (_sync)
         {
             _back.Timestamp = DateTime.Now;
+            _back.CaptureAge = captureAge;
             _back.FrameId = ++_frameId;
 
             (_front, _back) = (_back, _front);
@@ -98,6 +105,7 @@ public sealed class FrameBuffer
             copy.Resize(_front.Width, _front.Height);
             Array.Copy(_front.Pixels, copy.Pixels, _front.Width * _front.Height * 4);
             copy.Timestamp = _front.Timestamp;
+            copy.CaptureAge = _front.CaptureAge;
             copy.FrameId = _front.FrameId;
 
             frame = copy;

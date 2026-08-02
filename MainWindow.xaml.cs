@@ -261,11 +261,14 @@ public partial class MainWindow : Window
         long count = Interlocked.Increment(ref _frameCount);
         int width = frame.Width;
         int height = frame.Height;
-        DateTime timestamp = frame.Timestamp;
+
+        // 顯示影格年齡而非取出時刻：取出時刻永遠看起來是新的，
+        // 擷取管線積壓多久完全看不出來，而那才是延遲的來源。
+        long ageMilliseconds = (long)frame.CaptureAge.TotalMilliseconds;
 
         Dispatcher.InvokeAsync(() =>
         {
-            FrameInfoText.Text = $"{width} × {height} · {count} 幀 · {timestamp:HH:mm:ss}";
+            FrameInfoText.Text = $"{width} × {height} · {count} 幀 · 延遲 {ageMilliseconds} ms";
             UpdateMatchStatus();
         });
     }

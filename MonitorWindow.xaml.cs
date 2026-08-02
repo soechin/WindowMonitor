@@ -75,9 +75,6 @@ public partial class MonitorWindow : Window
     /// <summary>閃爍的相位，每輪詢一次進一格。</summary>
     private int _alertPhase;
 
-    /// <summary>由擷取執行緒設定、UI 執行緒的計時器讀取。</summary>
-    private volatile bool _pendingFrame;
-
     private double _normalOpacity = 1.0;
     private double _hoverOpacity = 0.6;
     private bool _fadeOnHover = true;
@@ -601,20 +598,21 @@ public partial class MonitorWindow : Window
 
     private void OnFrameCaptured(object? sender, FrameData frame)
     {
-        // 事件來自擷取執行緒，這裡只記下「有新畫面」，
-        // 實際讀取在 UI 執行緒重新向 FrameBuffer 取最新一幀，
+        // 事件來自擷取執行緒，直接排到 UI 執行緒畫，不要等下一次輪詢——
+        // 那會平白多出 0～60 ms，而且 Background 優先權在 UI 忙碌時還會被壓後。
+        // 這裡不碰傳進來的 frame，實際像素在 UI 執行緒重新向 FrameBuffer 取最新一幀，
         // 避免用到已被下一次擷取覆寫的緩衝區。
-        _pendingFrame = true;
+        if (Dispatcher.HasShutdownStarted)
+        {
+            return;
+        }
+
+        Dispatcher.InvokeAsync(RenderLatestFrame, DispatcherPriority.Render);
     }
 
     private void OnTimerTick(object? sender, EventArgs e)
     {
-        if (_pendingFrame)
-        {
-            _pendingFrame = false;
-            RenderLatestFrame();
-        }
-
+        // 畫面本身由 OnFrameCaptured 事件驅動；這裡只負責跟影格無關的動畫與輪詢
         UpdateOverlay();
         StepAlert();
         UpdateHoverState();
