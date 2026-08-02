@@ -6,6 +6,17 @@ using WindowMonitor.Capture;
 namespace WindowMonitor.Matching;
 
 /// <summary>
+/// 一輪「真正的擷取幀」比對完成後的結果。空陣列代表這一幀什麼都沒命中，
+/// 那與「沒有觸發事件」是兩回事——前者是有效的觀測值，後者是沒有觀測值。
+/// </summary>
+public sealed class MatchCycleEventArgs(IReadOnlyList<MatchResult> hits, long frameId) : EventArgs
+{
+    public IReadOnlyList<MatchResult> Hits { get; } = hits;
+
+    public long FrameId { get; } = frameId;
+}
+
+/// <summary>
 /// 對每一幀畫面執行 template matching。
 ///
 /// 比對直接在擷取執行緒上同步完成（<see cref="IFrameSource.FrameCaptured"/> 就是在那條
@@ -62,6 +73,17 @@ public sealed class TemplateMatcher : IDisposable
 
     public event EventHandler? ResultsUpdated;
 
+    /// <summary>
+    /// 每一輪擷取幀比對完成時觸發，包含空手而回的那些。與 <see cref="ResultsUpdated"/>
+    /// 的差別有三：一、帶著這一輪確切的命中清單，而不是要訂閱者自己回頭撈「最新的」；
+    /// 二、只有真正的擷取幀會觸發——UI 為了即時回饋而呼叫的 <see cref="MatchFrame"/>
+    /// 與 <see cref="ClearResults"/> 都不會；三、在鎖外觸發。
+    ///
+    /// 所以它是「畫面此刻實況」的可靠脈搏，適合拿來做上升緣、連續命中之類的狀態機。
+    /// 訂閱者跑在擷取執行緒上，絕對不可以阻塞。
+    /// </summary>
+    public event EventHandler<MatchCycleEventArgs>? MatchCycleCompleted;
+
     public void Attach(IFrameSource source)
     {
         Detach();
@@ -106,18 +128,28 @@ public sealed class TemplateMatcher : IDisposable
 
     private void OnFrameCaptured(object? sender, FrameData frame)
     {
-        MatchFrame(frame);
+        MatchFrame(frame, fromCapture: true);
     }
 
     /// <summary>
-    /// 對一幀執行比對。公開是為了讓測試不必真的跑一次擷取。
+    /// 對一幀執行比對。公開是為了讓 UI 能立刻重跑一次，以及讓測試不必真的跑一次擷取。
+    ///
+    /// 這條路徑不會觸發 <see cref="MatchCycleCompleted"/>：它重跑的是「手上那張舊的」，
+    /// 而不是新觀測到的畫面，餵給連續命中的判定只會憑空延長時間。
     /// </summary>
     public void MatchFrame(FrameData frame)
+    {
+        MatchFrame(frame, fromCapture: false);
+    }
+
+    private void MatchFrame(FrameData frame, bool fromCapture)
     {
         if (!IsEnabled || frame.IsEmpty || Library.Count == 0)
         {
             return;
         }
+
+        MatchResult[]? published = null;
 
         lock (_sync)
         {
@@ -159,13 +191,23 @@ public sealed class TemplateMatcher : IDisposable
                 LastElapsedMilliseconds = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
                 LastError = null;
 
-                Publish([.. hits]);
+                published = [.. hits];
+                Publish(published);
             }
             catch (Exception ex)
             {
                 // 比對出問題不該讓擷取迴圈跟著掛掉
                 LastError = ex.Message;
             }
+        }
+
+        // 刻意留在鎖外：訂閱者若做了耗時的事或拋了例外，都不該卡住擷取迴圈，
+        // 也不該被上面的 catch 誤記成「比對錯誤」。
+        // published 為 null 代表這一輪比對出錯，那是「沒有觀測值」而不是「沒命中」，
+        // 不觸發事件，讓訂閱者的狀態機維持原狀。
+        if (fromCapture && published is not null)
+        {
+            MatchCycleCompleted?.Invoke(this, new MatchCycleEventArgs(published, frame.FrameId));
         }
     }
 

@@ -51,6 +51,41 @@ public sealed class AppSettings
 
     public int HoverOpacityPercent { get; set; } = 60;
 
+    /// <summary>
+    /// 通知訊息的預設樣板。做成常數是因為 XAML 那邊要用 x:Static 綁同一份——
+    /// 這是所有設定裡唯一的長字串，兩邊各抄一份而抄錯的症狀是
+    /// 「使用者改了訊息，下次開啟卻被悄悄改回預設」，非常難察覺。
+    /// </summary>
+    public const string DefaultMessageTemplate = "{template} 出現了！{mention}";
+
+    public bool NotifyEnabled { get; set; }
+
+    /// <summary>
+    /// Discord Webhook 網址。null 代表尚未設定。
+    ///
+    /// 這是以純文字保存的憑證：拿到 settings.json 的人都能以這個 webhook 的身分
+    /// 往該頻道發訊息（但讀不到頻道內容，也做不了別的事）。不加密的理由是
+    /// .NET 上的 DPAPI（ProtectedData）要多裝一個 NuGet 套件，而且程式若能無條件
+    /// 解開金鑰，同一台機器上以相同身分執行的任何程式也解得開——換來的是
+    /// 「看起來安全」。外洩的處置成本很低：到 Discord 刪掉該 webhook 重建即可。
+    /// UI 上會明講這件事。
+    /// </summary>
+    public string? DiscordWebhookUrl { get; set; }
+
+    /// <summary>要被 @ 的 Discord 使用者 ID。null 代表 {mention} 展開成空字串。</summary>
+    public string? DiscordUserId { get; set; }
+
+    public string NotifyMessageTemplate { get; set; } = DefaultMessageTemplate;
+
+    /// <summary>樣板必須連續命中這麼久才通知。</summary>
+    public int NotifyDwellSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// 同一個樣板兩次通知之間的最短間隔。一段連續命中本來就只通知一次，
+    /// 這個值擋的是目標反覆消失又出現造成的洗版。
+    /// </summary>
+    public int NotifyCooldownSeconds { get; set; } = 300;
+
     /// <summary>null 代表沒有記錄，監控視窗開在右下角。</summary>
     public WindowPlacement? MonitorPlacement { get; set; }
 }

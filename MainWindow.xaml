@@ -1,9 +1,10 @@
 <Window x:Class="WindowMonitor.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:settings="clr-namespace:WindowMonitor.Settings"
         Title="WindowMonitor — 設定"
-        Height="620" Width="470"
-        MinHeight="520" MinWidth="440">
+        Height="680" Width="470"
+        MinHeight="560" MinWidth="440">
 
     <Window.Resources>
         <SolidColorBrush x:Key="SecondaryBrush" Color="#FF666666" />
@@ -223,6 +224,94 @@
                             <Button Content="另存目前畫面" Click="OnSaveFrameClick" Margin="8,0,0,0" MinWidth="110" />
                         </StackPanel>
                     </StackPanel>
+                </TabItem>
+
+                <TabItem Header="通知">
+                    <Grid Margin="4,8,4,4">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+
+                        <CheckBox x:Name="NotifyEnabledCheck"
+                                  Grid.Row="0" Grid.ColumnSpan="2"
+                                  Content="啟用 Discord 通知"
+                                  ToolTip="要擷取進行中、且「樣板比對」的「啟用比對」也打開，才會真的通知。"
+                                  Checked="OnNotifyOptionChanged"
+                                  Unchecked="OnNotifyOptionChanged" />
+
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Webhook 網址"
+                                   VerticalAlignment="Center" Margin="0,6,8,0" />
+                        <TextBox x:Name="WebhookUrlBox"
+                                 Grid.Row="1" Grid.Column="1" Margin="0,6,0,0"
+                                 VerticalContentAlignment="Center"
+                                 ToolTip="在 Discord 的「伺服器設定 → 整合 → Webhook」建立後複製網址貼上。這串網址等同密碼，會以純文字存在 settings.json，請勿連同執行檔資料夾一起分享。"
+                                 LostFocus="OnNotifyOptionChanged" />
+
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="使用者 ID"
+                                   VerticalAlignment="Center" Margin="0,6,8,0" />
+                        <TextBox x:Name="DiscordUserIdBox"
+                                 Grid.Row="2" Grid.Column="1" Margin="0,6,0,0"
+                                 HorizontalAlignment="Left" Width="200"
+                                 VerticalContentAlignment="Center"
+                                 ToolTip="要被 @ 的人。先到 Discord 的「使用者設定 → 進階」打開「開發者模式」，再對該使用者按右鍵選「複製使用者 ID」。留空則 {mention} 展開成空字串。"
+                                 LostFocus="OnNotifyOptionChanged" />
+
+                        <TextBlock Grid.Row="3" Grid.Column="0" Text="訊息"
+                                   VerticalAlignment="Top" Margin="0,10,8,0" />
+                        <!-- AcceptsReturn 所以刻意不掛 KeyDown：Enter 要換行，不是送出 -->
+                        <TextBox x:Name="MessageTemplateBox"
+                                 Grid.Row="3" Grid.Column="1" Margin="0,6,0,0"
+                                 Text="{x:Static settings:AppSettings.DefaultMessageTemplate}"
+                                 AcceptsReturn="True" TextWrapping="Wrap"
+                                 Height="48" VerticalScrollBarVisibility="Auto"
+                                 LostFocus="OnNotifyOptionChanged" />
+
+                        <TextBlock Grid.Row="4" Grid.Column="1" Margin="0,4,0,0"
+                                   Style="{StaticResource SecondaryText}"
+                                   Text="可用代碼：{template} {score} {x} {y} {time} {mention}"
+                                   ToolTip="{}{template} 樣板名稱／{score} 相似度／{x} {y} 命中區域左上角的畫面座標／{time} 時間／{mention} @ 上面那位使用者。&#x0a;樣板名稱含底線或星號時 Discord 會當成 Markdown，可以在訊息裡用反引號把它包起來。" />
+
+                        <StackPanel Grid.Row="5" Grid.ColumnSpan="2"
+                                    Orientation="Horizontal" Margin="0,10,0,0">
+                            <TextBlock Text="持續" VerticalAlignment="Center" Margin="0,0,6,0" />
+                            <TextBox x:Name="DwellSecondsBox" Text="5" Width="52"
+                                     VerticalContentAlignment="Center" TextAlignment="Right"
+                                     ToolTip="樣板必須連續命中這麼久才通知，中間只要有一次取樣沒命中就重新計時。範圍 0 ～ 3600 秒。"
+                                     LostFocus="OnNotifyOptionChanged"
+                                     KeyDown="OnNotifyNumberKeyDown" />
+                            <TextBlock Text="秒後通知" VerticalAlignment="Center" Margin="4,0,0,0" />
+
+                            <TextBlock Text="冷卻" VerticalAlignment="Center" Margin="20,0,6,0" />
+                            <TextBox x:Name="CooldownSecondsBox" Text="300" Width="52"
+                                     VerticalContentAlignment="Center" TextAlignment="Right"
+                                     ToolTip="一次出現只通知一則，目標留多久都不會再叫。冷卻管的是另一件事：目標消失又出現算全新的一次，會再通知，這段時間內則不會——用來擋掉目標反覆進出畫面時的洗版。範圍 1 ～ 86400 秒。"
+                                     LostFocus="OnNotifyOptionChanged"
+                                     KeyDown="OnNotifyNumberKeyDown" />
+                            <TextBlock Text="秒" VerticalAlignment="Center" Margin="4,0,0,0" />
+                        </StackPanel>
+
+                        <StackPanel Grid.Row="6" Grid.ColumnSpan="2"
+                                    Orientation="Horizontal" Margin="0,12,0,0">
+                            <Button Content="測試" Click="OnTestNotificationClick"
+                                    ToolTip="立刻用目前欄位裡的設定送一則訊息，確認網址與 @ 對象都正確。不必先勾選「啟用 Discord 通知」。" />
+                        </StackPanel>
+
+                        <TextBlock Grid.Row="7" Grid.ColumnSpan="2" Margin="0,12,0,0"
+                                   VerticalAlignment="Top"
+                                   Style="{StaticResource SecondaryText}"
+                                   Text="Webhook 網址會以純文字存在執行檔旁的 settings.json。拿到它的人可以往那個頻道發訊息，外流時請到 Discord 刪除該 Webhook 再重建一個。" />
+                    </Grid>
                 </TabItem>
             </TabControl>
         </Grid>

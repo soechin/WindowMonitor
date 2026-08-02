@@ -12,6 +12,7 @@ using WindowMonitor.Capture;
 using WindowMonitor.Interop;
 using WindowMonitor.Matching;
 using WindowMonitor.Models;
+using WindowMonitor.Notifications;
 using WindowMonitor.Settings;
 
 namespace WindowMonitor;
@@ -25,8 +26,21 @@ public partial class MainWindow : Window
     private const int MaxIntervalMilliseconds = 60_000;
     private const int DefaultIntervalMilliseconds = 1000;
 
+    private const int MinDwellSeconds = 0;
+    private const int MaxDwellSeconds = 3600;
+    private const int DefaultDwellSeconds = 5;
+
+    /// <summary>
+    /// 冷卻下限刻意是 1 秒而不是 0：0 的話「已連續命中滿 dwell」在之後的每一幀都成立，
+    /// 會變成每個擷取間隔送一則。
+    /// </summary>
+    private const int MinCooldownSeconds = 1;
+    private const int MaxCooldownSeconds = 86_400;
+    private const int DefaultCooldownSeconds = 300;
+
     private readonly GraphicsCaptureSource _source = new();
     private readonly TemplateMatcher _matcher = new();
+    private readonly MatchNotifier _notifier = new();
     private readonly AppSettings _settings = SettingsStore.Load();
     private MonitorWindow? _monitor;
     private long _frameCount;
@@ -46,6 +60,10 @@ public partial class MainWindow : Window
 
         // 比對就掛在擷取事件上，跟著擷取執行緒同步跑
         _matcher.Attach(_source);
+
+        // 通知只吃真正的擷取幀，UI 觸發的重比對不會餵進去（見 TemplateMatcher.MatchCycleCompleted）
+        _notifier.Attach(_matcher);
+        _notifier.StatusChanged += OnNotifierStatusChanged;
 
         InitializeOpacityOptions();
 
@@ -88,6 +106,23 @@ public partial class MainWindow : Window
 
         SelectOpacityLevel(OpacityCombo, OpacityLevels, _settings.OpacityPercent);
         SelectOpacityLevel(HoverOpacityCombo, HoverOpacityLevels, _settings.HoverOpacityPercent);
+
+        NotifyEnabledCheck.IsChecked = _settings.NotifyEnabled;
+        WebhookUrlBox.Text = _settings.DiscordWebhookUrl ?? string.Empty;
+        DiscordUserIdBox.Text = _settings.DiscordUserId ?? string.Empty;
+
+        // 訊息被清空過的話退回預設值，否則下次開啟會拿到一則空訊息
+        MessageTemplateBox.Text = string.IsNullOrWhiteSpace(_settings.NotifyMessageTemplate)
+            ? AppSettings.DefaultMessageTemplate
+            : _settings.NotifyMessageTemplate;
+
+        DwellSecondsBox.Text = Math
+            .Clamp(_settings.NotifyDwellSeconds, MinDwellSeconds, MaxDwellSeconds)
+            .ToString();
+
+        CooldownSecondsBox.Text = Math
+            .Clamp(_settings.NotifyCooldownSeconds, MinCooldownSeconds, MaxCooldownSeconds)
+            .ToString();
     }
 
     /// <summary>設定檔存的是百分比值，找不到對應檔位（陣列改過或值被改壞）就維持原選擇。</summary>
@@ -147,6 +182,7 @@ public partial class MainWindow : Window
         RefreshWindowList();
         ShowMonitorWindow();
         InitializeTemplates();
+        ApplyNotificationOptions();
     }
 
     private void ShowMonitorWindow()
@@ -222,6 +258,7 @@ public partial class MainWindow : Window
             // 換了目標視窗，舊畫面的命中位置不能再沿用
             _matcher.ForgetPositions();
             _matcher.ClearResults();
+            _notifier.ResetDwell();
 
             _targetLabel = target.Display;
 
@@ -261,6 +298,7 @@ public partial class MainWindow : Window
         _source.Stop();
         _matcher.ForgetPositions();
         _matcher.ClearResults();
+        _notifier.ResetDwell();
 
         SetCaptureUiState(false);
     }
@@ -301,6 +339,9 @@ public partial class MainWindow : Window
             {
                 SetCaptureUiState(false);
                 _targetLabel = null;
+
+                // 這條路徑不經過 OnStopClick，連續命中的計時要自己清
+                _notifier.ResetDwell();
 
                 if (e.State == CaptureState.TargetClosed)
                 {
@@ -418,6 +459,9 @@ public partial class MainWindow : Window
         _matcher.ForgetPositions();
         _matcher.ClearResults();
 
+        // 同名樣板也可能換成完全不同的圖，之前那段連續命中不算數
+        _notifier.ResetDwell();
+
         UpdateTemplateUi();
         RematchLatestFrame();
     }
@@ -525,6 +569,9 @@ public partial class MainWindow : Window
     {
         _matcher.IsEnabled = MatchEnabledCheck.IsChecked == true;
 
+        // 比對停過一段期間，那些幀完全沒有觀測值，不能接著上次的計時算
+        _notifier.ResetDwell();
+
         if (_matcher.IsEnabled)
         {
             RematchLatestFrame();
@@ -539,6 +586,9 @@ public partial class MainWindow : Window
     private void OnLocalSearchChanged(object sender, RoutedEventArgs e)
     {
         _matcher.UseLocalSearch = LocalSearchCheck.IsChecked == true;
+
+        // 判定方式變了，之前那段連續命中不再可比
+        _notifier.ResetDwell();
         RematchLatestFrame();
     }
 
@@ -553,6 +603,9 @@ public partial class MainWindow : Window
         }
 
         ThresholdText.Text = e.NewValue.ToString("F2");
+
+        // 門檻變了，之前那段連續命中不再可比
+        _notifier.ResetDwell();
         RematchLatestFrame();
     }
 
@@ -656,6 +709,22 @@ public partial class MainWindow : Window
         _settings.OpacityPercent = OpacityLevels[Math.Max(OpacityCombo.SelectedIndex, 0)];
         _settings.HoverOpacityPercent = HoverOpacityLevels[Math.Max(HoverOpacityCombo.SelectedIndex, 0)];
 
+        _settings.NotifyEnabled = NotifyEnabledCheck.IsChecked == true;
+
+        // 空字串一律存成 null，與 TemplateFolder 的慣例一致（「沒設定」而不是「設定成空的」）
+        string webhookUrl = WebhookUrlBox.Text.Trim();
+        _settings.DiscordWebhookUrl = webhookUrl.Length == 0 ? null : webhookUrl;
+
+        string userId = DiscordUserIdBox.Text.Trim();
+        _settings.DiscordUserId = userId.Length == 0 ? null : userId;
+
+        _settings.NotifyMessageTemplate = string.IsNullOrWhiteSpace(MessageTemplateBox.Text)
+            ? AppSettings.DefaultMessageTemplate
+            : MessageTemplateBox.Text;
+
+        _settings.NotifyDwellSeconds = ParseDwellSeconds();
+        _settings.NotifyCooldownSeconds = ParseCooldownSeconds();
+
         // 監控視窗沒開起來過（例如這台電腦不支援擷取）就保留載入時的記錄，不要清掉
         if (_monitor is not null)
         {
@@ -667,15 +736,97 @@ public partial class MainWindow : Window
     {
         _source.StateChanged -= OnCaptureStateChanged;
         _source.FrameCaptured -= OnFrameCaptured;
+        _notifier.StatusChanged -= OnNotifierStatusChanged;
 
         // 先關監控視窗再釋放擷取資源，避免它還在讀已釋放的緩衝
         _monitor?.Close();
         _monitor = null;
 
-        // 擷取先停下來，才不會有執行緒還在碰比對用的 Mat
+        // 擷取先停下來，才不會有執行緒還在碰比對用的 Mat；
+        // 停了之後也就不會再有 MatchCycleCompleted，通知才拆得乾淨
         _source.Dispose();
+        _notifier.Dispose();
         _matcher.Dispose();
 
         base.OnClosed(e);
+    }
+
+    // ── 通知 ────────────────────────────────────────────────
+
+    /// <summary>
+    /// 把通知欄位的內容整包推給 <see cref="MatchNotifier"/>。
+    /// 設定是不可變的快照，所以一律整包換掉，不做逐欄位更新。
+    /// </summary>
+    private void ApplyNotificationOptions()
+    {
+        _notifier.Options = new NotificationOptions(
+            Enabled: NotifyEnabledCheck.IsChecked == true,
+            WebhookUrl: WebhookUrlBox.Text.Trim(),
+            UserId: DiscordUserIdBox.Text.Trim(),
+            MessageTemplate: MessageTemplateBox.Text,
+            Dwell: TimeSpan.FromSeconds(ParseDwellSeconds()),
+            Cooldown: TimeSpan.FromSeconds(ParseCooldownSeconds()));
+    }
+
+    private int ParseDwellSeconds()
+    {
+        return ParseSeconds(DwellSecondsBox, MinDwellSeconds, MaxDwellSeconds, DefaultDwellSeconds);
+    }
+
+    private int ParseCooldownSeconds()
+    {
+        return ParseSeconds(
+            CooldownSecondsBox,
+            MinCooldownSeconds,
+            MaxCooldownSeconds,
+            DefaultCooldownSeconds);
+    }
+
+    /// <summary>
+    /// 讀一個秒數欄位並夾回合法範圍，順便把夾過的值寫回去——使用者要看得到
+    /// 自己打的 99999 其實被當成什麼用。比照 <see cref="ParseInterval"/> 的作法。
+    /// </summary>
+    private static int ParseSeconds(TextBox box, int minimum, int maximum, int fallback)
+    {
+        int value = int.TryParse(box.Text, out int parsed)
+            ? Math.Clamp(parsed, minimum, maximum)
+            : fallback;
+
+        string text = value.ToString();
+
+        if (box.Text != text)
+        {
+            box.Text = text;
+        }
+
+        return value;
+    }
+
+    private void OnNotifyOptionChanged(object sender, RoutedEventArgs e) => ApplyNotificationOptions();
+
+    private void OnNotifyNumberKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            ApplyNotificationOptions();
+        }
+    }
+
+    private void OnTestNotificationClick(object sender, RoutedEventArgs e)
+    {
+        // 先套用：使用者很可能剛貼完網址就直接按測試，那個欄位還沒失焦
+        ApplyNotificationOptions();
+        _notifier.SendTest();
+    }
+
+    /// <summary>通知的訊息來自送出執行緒，與 OnCaptureStateChanged 一樣要跳回 UI。</summary>
+    private void OnNotifierStatusChanged(object? sender, NotificationStatusEventArgs e)
+    {
+        if (Dispatcher.HasShutdownStarted)
+        {
+            return;
+        }
+
+        Dispatcher.InvokeAsync(() => SetStatus(e.Message, e.IsError, e.Details));
     }
 }
