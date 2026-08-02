@@ -9,7 +9,7 @@
         Topmost="True"
         ShowInTaskbar="False"
         ResizeMode="CanResize"
-        Background="#FF101010"
+        Background="Transparent"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
         MouseLeftButtonDown="OnMouseLeftButtonDown">
@@ -19,28 +19,38 @@
         所有設定都在主視窗，這裡不放任何控制項。
         1px 邊框只用來界定範圍。
     -->
-    <Border BorderBrush="#FF3C3C3C" BorderThickness="1">
-        <Grid>
-            <Image x:Name="FrameImage"
-                   Stretch="Uniform"
-                   RenderOptions.BitmapScalingMode="HighQuality" />
+    <Grid>
+        <!-- 內容層：不透明度由 StepOpacity 控制，整層一起淡出 -->
+        <Border x:Name="ContentLayer"
+                Background="#FF101010"
+                BorderBrush="#FF3C3C3C"
+                BorderThickness="1">
+            <Grid>
+                <Image x:Name="FrameImage"
+                       Stretch="Uniform"
+                       RenderOptions.BitmapScalingMode="HighQuality" />
 
-            <!-- template matching 命中位置的點標記畫在這裡 -->
-            <Canvas x:Name="Overlay" IsHitTestVisible="False" />
+                <!-- template matching 命中位置的點標記畫在這裡 -->
+                <Canvas x:Name="Overlay" IsHitTestVisible="False" />
 
-            <TextBlock x:Name="PlaceholderText"
-                       Text="尚未開始擷取"
-                       Foreground="#FF808080"
-                       FontSize="13"
-                       HorizontalAlignment="Center"
-                       VerticalAlignment="Center" />
+                <TextBlock x:Name="PlaceholderText"
+                           Text="尚未開始擷取"
+                           Foreground="#FF808080"
+                           FontSize="13"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center" />
+            </Grid>
+        </Border>
 
-            <!-- 命中時的警告框，透明度由 StepAlert 逐格控制 -->
-            <Border x:Name="AlertBorder"
-                    BorderBrush="#FFFF3B30"
-                    BorderThickness="3"
-                    IsHitTestVisible="False"
-                    Visibility="Collapsed" />
-        </Grid>
-    </Border>
+        <!--
+            命中時的警告框，明暗由 StepAlert 逐格控制。
+            刻意放在 ContentLayer 之外，才不會被視窗不透明度乘算——
+            使用者把畫面調得再淡，警告都要一樣醒目。
+        -->
+        <Border x:Name="AlertBorder"
+                BorderBrush="#FFFF3B30"
+                BorderThickness="3"
+                IsHitTestVisible="False"
+                Visibility="Collapsed" />
+    </Grid>
 </Window>

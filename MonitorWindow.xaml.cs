@@ -152,11 +152,14 @@ public partial class MonitorWindow : Window
         // 系統原本提供的邊緣縮放熱區會消失。這裡自己補回來。
         HwndSource.FromHwnd(_handle)?.AddHook(WndProc);
 
-        // 透明度走 WPF 的 Window.Opacity（需要 AllowsTransparency="True"）。
-        // 原本試過 WS_EX_LAYERED + SetLayeredWindowAttributes，但 WPF 在硬體轉譯
-        // 路徑下會把 WS_EX_LAYERED 清掉，透明度完全不會生效。
+        // 透明度套在 ContentLayer 而不是 Window.Opacity——後者作用於整個視窗的合成
+        // 結果，會連警告紅框一起乘算掉（40% 視窗 × 閃爍波谷 0.2 幾乎看不見）。
+        // Window.Opacity 固定維持 1.0，AlertBorder 掛在 ContentLayer 之外。
+        // 另註：原本試過 WS_EX_LAYERED + SetLayeredWindowAttributes，但 WPF 在硬體
+        // 轉譯路徑下會把 WS_EX_LAYERED 清掉，透明度完全不會生效；靠
+        // AllowsTransparency="True" 讓 WPF 自己走分層合成才正確。
         // 本視窗只是每秒更新一張點陣圖，走軟體轉譯的成本可以忽略。
-        Opacity = TargetOpacity;
+        ContentLayer.Opacity = TargetOpacity;
         ApplyClickThrough();
 
         PositionAtBottomRight();
@@ -373,8 +376,9 @@ public partial class MonitorWindow : Window
     }
 
     /// <summary>
-    /// 命中期間讓警告紅框週期性明暗變化。刻意不動 Window.Opacity——
-    /// 那個每次輪詢都被 StepOpacity 覆寫，兩邊會打架。
+    /// 命中期間讓警告紅框週期性明暗變化。AlertBorder 掛在 ContentLayer 之外、
+    /// Window.Opacity 又固定是 1.0，所以這裡寫進去的值就是最終看到的 alpha，
+    /// 不會被使用者設定的視窗不透明度稀釋。
     /// </summary>
     private void StepAlert()
     {
@@ -433,19 +437,20 @@ public partial class MonitorWindow : Window
     private void StepOpacity()
     {
         double target = TargetOpacity;
-        double delta = target - Opacity;
+        double current = ContentLayer.Opacity;
+        double delta = target - current;
 
         if (Math.Abs(delta) < 0.005)
         {
-            if (Opacity != target)
+            if (current != target)
             {
-                Opacity = target;
+                ContentLayer.Opacity = target;
             }
 
             return;
         }
 
-        Opacity += Math.Clamp(delta, -OpacityStep, OpacityStep);
+        ContentLayer.Opacity = current + Math.Clamp(delta, -OpacityStep, OpacityStep);
     }
 
     private void ApplyClickThrough()
