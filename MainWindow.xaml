@@ -149,7 +149,7 @@
                                       Content="命中後只在附近搜尋"
                                       Margin="20,4,0,4"
                                       IsChecked="True"
-                                      ToolTip="大幅省下比對時間。目標會在畫面中大範圍移動時可以關閉。"
+                                      ToolTip="命中過一次後就一直在該處附近（約四分之一畫面）搜尋，大幅省下比對時間。每 10 幀仍會全圖重掃一次，目標換位置也找得回來。目標會在畫面中大範圍移動時可以關閉。"
                                       Checked="OnLocalSearchChanged"
                                       Unchecked="OnLocalSearchChanged" />
                         </StackPanel>

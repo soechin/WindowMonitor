@@ -11,7 +11,7 @@ public sealed class TemplateItem(string name, string path, Mat image) : IDisposa
 
     public string Path { get; } = path;
 
-    /// <summary>BGR 三通道。比對時直接使用，不要在外部修改。</summary>
+    /// <summary>灰階單通道。比對時直接使用，不要在外部修改。</summary>
     public Mat Image { get; } = image;
 
     public int Width => Image.Width;

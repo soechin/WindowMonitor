@@ -16,25 +16,36 @@ namespace WindowMonitor.Matching;
 /// </summary>
 public sealed class TemplateMatcher : IDisposable
 {
-    /// <summary>ROI 至少要往外擴這麼多像素，避免小樣板的搜尋範圍過於侷促。</summary>
-    private const int MinimumPadding = 32;
+    /// <summary>
+    /// 每隔這麼多幀強制全圖搜尋一次。
+    ///
+    /// 局部搜尋落空時不會忘掉位置（見 <see cref="TryMatch"/>），因此目標若跑到 ROI
+    /// 之外重新出現就再也找不回來。這個週期性的全圖掃描就是為了補住那個破口，
+    /// 代價是那種情境下偵測最多延後這麼多幀。
+    ///
+    /// 以幀數而非秒數計：不論擷取頻率怎麼調，全圖搜尋永遠只佔固定比例的幀。
+    /// </summary>
+    private const int FullSweepIntervalFrames = 10;
 
     private readonly Lock _sync = new();
 
     private IFrameSource? _source;
-    private Mat? _bgr;
+    private Mat? _gray;
     private Mat? _scores;
     private ResultSet _results = new(0, []);
 
     private long _resultId;
     private int _lastWidth;
     private int _lastHeight;
+    private int _framesSinceSweep;
 
     public TemplateLibrary Library { get; } = new();
 
     public bool IsEnabled { get; set; }
 
-    /// <summary>命中後只在上次位置附近搜尋。目標會大幅移動時可關閉。</summary>
+    /// <summary>
+    /// 命中過之後就一直只在上次位置附近搜尋。目標會大幅移動時可關閉。
+    /// </summary>
     public bool UseLocalSearch { get; set; } = true;
 
     public double Threshold { get; set; } = 0.80;
@@ -120,9 +131,16 @@ public sealed class TemplateMatcher : IDisposable
                     _lastHeight = frame.Height;
                 }
 
+                // 這一幀輪到全圖重掃了嗎
+                bool sweep = ++_framesSinceSweep >= FullSweepIntervalFrames;
+                if (sweep)
+                {
+                    _framesSinceSweep = 0;
+                }
+
                 long start = Stopwatch.GetTimestamp();
 
-                ConvertToBgr(frame);
+                ConvertToGray(frame);
 
                 List<MatchResult> hits = [];
                 int local = 0;
@@ -130,7 +148,7 @@ public sealed class TemplateMatcher : IDisposable
 
                 Library.ForEach(item =>
                 {
-                    if (TryMatch(item, frame.FrameId, ref local, ref full, out MatchResult? hit))
+                    if (TryMatch(item, frame.FrameId, sweep, ref local, ref full, out MatchResult? hit))
                     {
                         hits.Add(hit);
                     }
@@ -151,19 +169,19 @@ public sealed class TemplateMatcher : IDisposable
         }
     }
 
-    private void ConvertToBgr(FrameData frame)
+    private void ConvertToGray(FrameData frame)
     {
-        if (_bgr is null || _bgr.Width != frame.Width || _bgr.Height != frame.Height)
+        if (_gray is null || _gray.Width != frame.Width || _gray.Height != frame.Height)
         {
-            _bgr?.Dispose();
-            _bgr = new Mat(frame.Height, frame.Width, MatType.CV_8UC3);
+            _gray?.Dispose();
+            _gray = new Mat(frame.Height, frame.Width, MatType.CV_8UC1);
         }
 
-        WrapAndConvert(frame, _bgr);
+        WrapAndConvert(frame, _gray);
     }
 
     /// <summary>
-    /// 把 FrameData 的 BGRA 緩衝零複製地包成 Mat 再轉成 BGR。
+    /// 把 FrameData 的 BGRA 緩衝零複製地包成 Mat 再轉成灰階。
     /// 用 fixed 指標而不是 byte[] 多載，避免 GC 在轉換途中搬動陣列。
     /// </summary>
     private static unsafe void WrapAndConvert(FrameData frame, Mat destination)
@@ -179,54 +197,61 @@ public sealed class TemplateMatcher : IDisposable
                 (IntPtr)pixels,
                 frame.Stride);
 
-            // alpha 對視窗內容沒有意義，留著只會讓分數受不確定的值影響
-            Cv2.CvtColor(bgra, destination, ColorConversionCodes.BGRA2BGR);
+            // 只比形狀，所以直接轉單通道灰階：MatchTemplate 的成本正比於通道數，
+            // 這一步就省下三分之二。alpha 對視窗內容沒有意義，一併丟掉。
+            Cv2.CvtColor(bgra, destination, ColorConversionCodes.BGRA2GRAY);
         }
     }
 
     private bool TryMatch(
         TemplateItem item,
         long frameId,
+        bool forceFullSweep,
         ref int localCount,
         ref int fullCount,
         [NotNullWhen(true)] out MatchResult? result)
     {
         result = null;
 
-        if (_bgr is null || item.Width > _bgr.Width || item.Height > _bgr.Height)
+        if (_gray is null || item.Width > _gray.Width || item.Height > _gray.Height)
         {
             // 樣板比畫面大時 MatchTemplate 會直接拋例外，必須先擋掉
             item.ForgetPosition();
             return false;
         }
 
-        if (UseLocalSearch && item.HasLastHit)
+        if (UseLocalSearch && item.HasLastHit && !forceFullSweep)
         {
             localCount++;
-            if (TrySearch(item, BuildRoi(item, _bgr.Width, _bgr.Height), frameId, out result))
-            {
-                return true;
-            }
 
-            // 附近找不到就忘掉位置，同一幀立刻退回全圖——這樣結果才會與
-            // 每幀全圖搜尋完全一致，局部搜尋純粹是省時間，不會漏偵測。
-            item.ForgetPosition();
+            // 附近找不到就只代表這一幀沒出現，位置要留著。這正是省下大部分成本的地方：
+            // 監控的常態是「東西還沒出現」，一落空就忘掉位置的話，等待期間每一幀都會
+            // 退回全圖卷積。代價是目標若跑到 ROI 之外重新出現會漏掉，
+            // 由 FullSweepIntervalFrames 的全圖重掃補住。
+            return TrySearch(item, BuildRoi(item, _gray.Width, _gray.Height), frameId, out result);
         }
 
         fullCount++;
-        return TrySearch(item, new Rect(0, 0, _bgr.Width, _bgr.Height), frameId, out result);
+        return TrySearch(item, new Rect(0, 0, _gray.Width, _gray.Height), frameId, out result);
     }
 
+    /// <summary>
+    /// 以上次命中的中心為中心，取約四分之一畫面（半寬 × 半高）的搜尋範圍。
+    /// 目標固定出現在某處、只會稍微偏移，這個餘裕綽綽有餘，而面積只有全圖的 1/4。
+    /// </summary>
     private static Rect BuildRoi(TemplateItem item, int frameWidth, int frameHeight)
     {
-        int padding = Math.Max(MinimumPadding, Math.Max(item.Width, item.Height));
+        // 樣板本身可能比半個畫面還大，範圍不能小於它
+        int width = Math.Clamp(frameWidth / 2, item.Width, frameWidth);
+        int height = Math.Clamp(frameHeight / 2, item.Height, frameHeight);
 
-        int left = Math.Max(0, item.LastX - padding);
-        int top = Math.Max(0, item.LastY - padding);
-        int right = Math.Min(frameWidth, item.LastX + item.Width + padding);
-        int bottom = Math.Min(frameHeight, item.LastY + item.Height + padding);
+        int centerX = item.LastX + (item.Width / 2);
+        int centerY = item.LastY + (item.Height / 2);
 
-        return new Rect(left, top, right - left, bottom - top);
+        int left = Math.Clamp(centerX - (width / 2), 0, frameWidth - width);
+        int top = Math.Clamp(centerY - (height / 2), 0, frameHeight - height);
+
+        return new Rect(left, top, width, height);
     }
 
     private bool TrySearch(
@@ -245,7 +270,7 @@ public sealed class TemplateMatcher : IDisposable
         Mat scores = EnsureScores(region.Width - item.Width + 1, region.Height - item.Height + 1);
 
         // new Mat(src, rect) 取的是 view 而非複本，不會多複製像素
-        using Mat view = new(_bgr!, region);
+        using Mat view = new(_gray!, region);
 
         Cv2.MatchTemplate(view, item.Image, scores, TemplateMatchModes.CCoeffNormed);
         Cv2.MinMaxLoc(scores, out _, out double score, out _, out Point location);
@@ -289,8 +314,8 @@ public sealed class TemplateMatcher : IDisposable
 
         lock (_sync)
         {
-            _bgr?.Dispose();
-            _bgr = null;
+            _gray?.Dispose();
+            _gray = null;
 
             _scores?.Dispose();
             _scores = null;

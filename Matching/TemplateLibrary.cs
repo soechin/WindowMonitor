@@ -146,8 +146,10 @@ public sealed class TemplateLibrary : IDisposable
         {
             // 一律走 ImDecode 而非 ImRead：ImRead 把路徑交給原生層以 ANSI 處理，
             // 只要路徑或檔名含中文就會靜默失敗（回傳空 Mat）。
+            // 灰階載入：比對只看形狀，彩色會讓 MatchTemplate 多算兩個通道。
+            // 樣板與畫面必須同為單通道，見 TemplateMatcher.ConvertToGray。
             byte[] bytes = File.ReadAllBytes(path);
-            Mat image = Cv2.ImDecode(bytes, ImreadModes.Color);
+            Mat image = Cv2.ImDecode(bytes, ImreadModes.Grayscale);
 
             if (image.Empty())
             {
