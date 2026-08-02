@@ -27,7 +27,14 @@ public sealed class GraphicsCaptureSource : IFrameSource
     /// <summary>連續這麼久都沒有新畫面，才視為目標沒在呈現。</summary>
     private const int StaleThresholdMilliseconds = 3000;
 
+    /// <summary>保護底下那些欄位。只在極短的區段內持有。</summary>
     private readonly Lock _sync = new();
+
+    /// <summary>
+    /// 串接 Start 與 Stop 的生命週期鎖，與 <see cref="_sync"/> 分開：
+    /// 這一把要橫跨「等待擷取迴圈退出」的整段時間，不能讓另一邊趁隙插進來建新 session。
+    /// </summary>
+    private readonly Lock _lifecycle = new();
 
     private D3D11Helper? _d3d;
     private IDirect3DDevice? _device;
@@ -41,6 +48,13 @@ public sealed class GraphicsCaptureSource : IFrameSource
 
     private IntPtr _targetWindow;
     private SizeInt32 _poolSize;
+
+    /// <summary>
+    /// session 的世代，每次 <see cref="Start"/> 建立新 session 就 +1。
+    /// 目標關閉時排到別的執行緒去收拾的那個 Stop 會帶著當時的世代，
+    /// 收拾前先確認沒有換代。
+    /// </summary>
+    private long _generation;
 
     /// <summary>由擷取執行緒寫入、UI 執行緒讀取。</summary>
     private volatile CaptureState _state = CaptureState.Stopped;
@@ -102,43 +116,49 @@ public sealed class GraphicsCaptureSource : IFrameSource
             throw new ArgumentException("目標視窗無效。", nameof(targetWindow));
         }
 
-        Stop();
-
-        lock (_sync)
+        // 整個「停掉舊的、建起新的」必須是一個不可分割的動作，否則目標關閉時
+        // 排在背景的那個 Stop 可能插在中間，把剛建好的 session 拆掉。
+        lock (_lifecycle)
         {
-            try
+            StopLocked(null);
+
+            lock (_sync)
             {
-                _targetWindow = targetWindow;
-                _d3d = new D3D11Helper();
-                _device = CaptureInterop.CreateDirect3DDevice(_d3d.Device);
-                _item = CaptureInterop.CreateItemForWindow(targetWindow);
-                _item.Closed += OnItemClosed;
+                try
+                {
+                    _generation++;
+                    _targetWindow = targetWindow;
+                    _d3d = new D3D11Helper();
+                    _device = CaptureInterop.CreateDirect3DDevice(_d3d.Device);
+                    _item = CaptureInterop.CreateItemForWindow(targetWindow);
+                    _item.Closed += OnItemClosed;
 
-                _poolSize = _item.Size;
-                _framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
-                    _device,
-                    CaptureFormat,
-                    BufferCount,
-                    _poolSize);
+                    _poolSize = _item.Size;
+                    _framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
+                        _device,
+                        CaptureFormat,
+                        BufferCount,
+                        _poolSize);
 
-                _session = _framePool.CreateCaptureSession(_item);
-                ConfigureSession(_session);
-                _session.StartCapture();
+                    _session = _framePool.CreateCaptureSession(_item);
+                    ConfigureSession(_session);
+                    _session.StartCapture();
 
-                Frames.Clear();
-                _emptyFrameStreak = 0;
+                    Frames.Clear();
+                    _emptyFrameStreak = 0;
 
-                _cancellation = new CancellationTokenSource();
-                _timer = new PeriodicTimer(TimeSpan.FromMilliseconds(_intervalMilliseconds));
-                _captureLoop = Task.Run(() => CaptureLoopAsync(_cancellation.Token));
+                    _cancellation = new CancellationTokenSource();
+                    _timer = new PeriodicTimer(TimeSpan.FromMilliseconds(_intervalMilliseconds));
+                    _captureLoop = Task.Run(() => CaptureLoopAsync(_cancellation.Token));
 
-                SetState(CaptureState.Running, "擷取中");
-            }
-            catch (Exception ex)
-            {
-                DisposeCaptureResources();
-                SetState(CaptureState.Failed, $"啟動擷取失敗：{ex.Message}");
-                throw;
+                    SetState(CaptureState.Running, "擷取中");
+                }
+                catch (Exception ex)
+                {
+                    DisposeCaptureResources();
+                    SetState(CaptureState.Failed, $"啟動擷取失敗：{ex.Message}");
+                    throw;
+                }
             }
         }
     }
@@ -280,9 +300,22 @@ public sealed class GraphicsCaptureSource : IFrameSource
 
         SetState(CaptureState.TargetClosed, "目標視窗已關閉");
 
+        long generation;
+        lock (_sync)
+        {
+            generation = _generation;
+        }
+
         // Stop() 會等待擷取迴圈結束，而這裡可能正是在該迴圈上執行，
-        // 因此丟到別的執行緒去收拾，避免自我等待。
-        Task.Run(Stop);
+        // 因此丟到別的執行緒去收拾，避免自我等待。帶上世代：這段期間 UI 已經
+        // 解鎖了「開始擷取」，使用者若馬上啟動新的擷取，這次收拾必須放手。
+        Task.Run(() =>
+        {
+            lock (_lifecycle)
+            {
+                StopLocked(generation);
+            }
+        });
     }
 
     private void SetState(CaptureState state, string message)
@@ -299,11 +332,32 @@ public sealed class GraphicsCaptureSource : IFrameSource
 
     public void Stop()
     {
+        lock (_lifecycle)
+        {
+            StopLocked(null);
+        }
+    }
+
+    /// <summary>
+    /// 停止擷取。呼叫端必須已持有 <see cref="_lifecycle"/>。
+    /// </summary>
+    /// <param name="generation">
+    /// 指定時，只有在 session 世代仍相符的情況下才真的停——用於目標關閉後排到
+    /// 別的執行緒去收拾的那次呼叫，期間使用者若已重新啟動擷取就什麼都不該做。
+    /// null 代表無條件停止（使用者按停止、或 <see cref="Start"/> 換目標）。
+    /// </param>
+    private void StopLocked(long? generation)
+    {
         CancellationTokenSource? cancellation;
         Task? loop;
 
         lock (_sync)
         {
+            if (generation is long expected && _generation != expected)
+            {
+                return;
+            }
+
             cancellation = _cancellation;
             loop = _captureLoop;
             _cancellation = null;
@@ -312,10 +366,13 @@ public sealed class GraphicsCaptureSource : IFrameSource
 
         cancellation?.Cancel();
 
-        // 等擷取迴圈退出後才釋放原生資源，否則會在讀回途中把材質抽掉
+        // 等擷取迴圈退出後才釋放原生資源，否則會在讀回途中把材質抽掉。
+        // 這裡刻意不設逾時：逾時就往下釋放等於明知故犯，而取消只在
+        // WaitForNextTickAsync 被觀察到，最久就是一次 CaptureOnce
+        // （含同步跑的 template matching）的時間，是有界的。
         try
         {
-            loop?.Wait(TimeSpan.FromSeconds(2));
+            loop?.Wait();
         }
         catch (AggregateException)
         {
