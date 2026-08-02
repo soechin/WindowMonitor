@@ -21,6 +21,28 @@ internal struct POINT
     public int Y;
 }
 
+/// <summary>WM_WINDOWPOSCHANGING 的 lParam。欄位順序必須與 Win32 一致。</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct WINDOWPOS
+{
+    public IntPtr hwnd;
+    public IntPtr hwndInsertAfter;
+    public int x;
+    public int y;
+    public int cx;
+    public int cy;
+    public int flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct MONITORINFO
+{
+    public int cbSize;
+    public RECT rcMonitor;
+    public RECT rcWork;
+    public int dwFlags;
+}
+
 internal static partial class NativeMethods
 {
     // 視窗擴充樣式
@@ -47,6 +69,27 @@ internal static partial class NativeMethods
     public const int HTBOTTOM = 15;
     public const int HTBOTTOMLEFT = 16;
     public const int HTBOTTOMRIGHT = 17;
+
+    // 縮放與移動
+    public const int WM_SIZING = 0x0214;
+    public const int WM_WINDOWPOSCHANGING = 0x0046;
+
+    // WM_SIZING 的 wParam：使用者正在拖哪一條邊或哪一個角
+    public const int WMSZ_LEFT = 1;
+    public const int WMSZ_RIGHT = 2;
+    public const int WMSZ_TOP = 3;
+    public const int WMSZ_TOPLEFT = 4;
+    public const int WMSZ_TOPRIGHT = 5;
+    public const int WMSZ_BOTTOM = 6;
+    public const int WMSZ_BOTTOMLEFT = 7;
+    public const int WMSZ_BOTTOMRIGHT = 8;
+
+    // WINDOWPOS.flags
+    public const int SWP_NOSIZE = 0x0001;
+    public const int SWP_NOMOVE = 0x0002;
+
+    // MonitorFromRect
+    public const int MONITOR_DEFAULTTONEAREST = 0x00000002;
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
@@ -91,6 +134,13 @@ internal static partial class NativeMethods
     public static partial bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
     [LibraryImport("user32.dll")]
+    public static partial IntPtr MonitorFromRect(ref RECT lprc, int dwFlags);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetMonitorInfoW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [LibraryImport("user32.dll")]
     public static partial uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
     [LibraryImport("user32.dll")]
@@ -124,6 +174,32 @@ internal static partial class NativeMethods
     {
         // 呼叫失敗時（例如舊版系統）視為未 cloaked，交由其他條件過濾
         return DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0;
+    }
+
+    /// <summary>
+    /// 取得與指定矩形最接近之螢幕的完整範圍與工作區（皆為實體像素）。
+    /// 取不到時回傳 false，呼叫端應直接放棄箝制，不要拿未初始化的數值硬算。
+    /// </summary>
+    public static bool TryGetMonitorBounds(RECT reference, out RECT monitor, out RECT work)
+    {
+        monitor = default;
+        work = default;
+
+        IntPtr handle = MonitorFromRect(ref reference, MONITOR_DEFAULTTONEAREST);
+        if (handle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(handle, ref info))
+        {
+            return false;
+        }
+
+        monitor = info.rcMonitor;
+        work = info.rcWork;
+        return true;
     }
 
     public static bool HasExStyle(IntPtr hWnd, int style)

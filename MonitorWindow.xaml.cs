@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -27,6 +28,18 @@ public partial class MonitorWindow : Window
     /// <summary>視窗邊緣可用來縮放的寬度（DIP）。</summary>
     private const double ResizeBorderThickness = 8;
 
+    /// <summary>
+    /// ContentLayer 左右／上下各 1px 邊框，換算長寬比時要從視窗尺寸扣掉，
+    /// 否則畫面區的比例永遠差一點，letterbox 黑邊不會完全消失。
+    /// </summary>
+    private const double ChromeThickness = 2;
+
+    /// <summary>
+    /// 視窗任一邊的最小長度（DIP）。XAML 的 MinWidth／MinHeight 只是絕對下限，
+    /// 實際下限在這裡以「保持長寬比」的方式計算，避免兩者互相打架。
+    /// </summary>
+    private const double MinEdgeLength = 96;
+
     /// <summary>命中標籤的高度（DIP），用來讓標籤對齊點的垂直中心。</summary>
     private const double MarkerLabelHeight = 15;
 
@@ -49,6 +62,9 @@ public partial class MonitorWindow : Window
     private WriteableBitmap? _bitmap;
     private IntPtr _handle;
     private bool _isHovered;
+
+    /// <summary>目標畫面的寬高比（寬÷高）。0 代表還沒收到任何影格，此時不鎖比例。</summary>
+    private double _aspectRatio;
 
     /// <summary>上次畫進 Overlay 的結果版本。−1 代表「下次一定重畫」。</summary>
     private long _overlayResultId = -1;
@@ -80,8 +96,12 @@ public partial class MonitorWindow : Window
         };
         _timer.Tick += OnTimerTick;
 
-        // 視窗大小改變後 letterbox 的縮放與位移都會變，命中框必須重算
-        SizeChanged += (_, _) => _overlayResultId = -1;
+        SizeChanged += (_, _) =>
+        {
+            // 視窗大小改變後 letterbox 的縮放與位移都會變，命中框必須重算
+            _overlayResultId = -1;
+            ClampPositionToMonitor();
+        };
     }
 
     /// <summary>
@@ -166,17 +186,23 @@ public partial class MonitorWindow : Window
         _timer.Start();
     }
 
-    /// <summary>
-    /// 只處理 WM_NCHITTEST，讓視窗邊緣重新變成縮放熱區。
-    /// 中央維持 HTCLIENT，這樣 DragMove 才能照常拖曳。
-    /// </summary>
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
-        if (msg != NativeMethods.WM_NCHITTEST)
+        return msg switch
         {
-            return IntPtr.Zero;
-        }
+            NativeMethods.WM_NCHITTEST => HandleNcHitTest(hwnd, lParam, ref handled),
+            NativeMethods.WM_SIZING => HandleSizing(wParam, lParam, ref handled),
+            NativeMethods.WM_WINDOWPOSCHANGING => HandleWindowPosChanging(hwnd, lParam, ref handled),
+            _ => IntPtr.Zero
+        };
+    }
 
+    /// <summary>
+    /// 讓視窗邊緣重新變成縮放熱區。
+    /// 中央維持 HTCLIENT，這樣 DragMove 才能照常拖曳。
+    /// </summary>
+    private IntPtr HandleNcHitTest(IntPtr hwnd, IntPtr lParam, ref bool handled)
+    {
         if (!NativeMethods.GetWindowRect(hwnd, out RECT bounds))
         {
             return IntPtr.Zero;
@@ -216,14 +242,361 @@ public partial class MonitorWindow : Window
         return hit;
     }
 
+    /// <summary>
+    /// 使用者拖曳邊框縮放時介入：鎖定長寬比，並且不讓視窗長到螢幕外面。
+    /// lParam 是實體像素的螢幕座標矩形。
+    /// </summary>
+    private IntPtr HandleSizing(IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        RECT rect = Marshal.PtrToStructure<RECT>(lParam);
+        int edge = (int)wParam;
+
+        // 被拖的那條邊要跟著游標，所以固定「對面那條邊」當錨點回推新矩形
+        bool anchorRight = edge is NativeMethods.WMSZ_LEFT
+            or NativeMethods.WMSZ_TOPLEFT
+            or NativeMethods.WMSZ_BOTTOMLEFT;
+        bool anchorBottom = edge is NativeMethods.WMSZ_TOP
+            or NativeMethods.WMSZ_TOPLEFT
+            or NativeMethods.WMSZ_TOPRIGHT;
+
+        // 只拖上下邊時由高推寬，其餘（左右邊與四個角）都由寬推高
+        bool drivenByHeight = edge is NativeMethods.WMSZ_TOP or NativeMethods.WMSZ_BOTTOM;
+
+        DpiScale dpi = VisualTreeHelper.GetDpi(this);
+        double chromeX = ChromeThickness * dpi.DpiScaleX;
+        double chromeY = ChromeThickness * dpi.DpiScaleY;
+        double minWidth = MinEdgeLength * dpi.DpiScaleX;
+        double minHeight = MinEdgeLength * dpi.DpiScaleY;
+
+        // 從錨點邊算到螢幕邊界，就是這次縮放最多能長到多大
+        double availWidth = double.PositiveInfinity;
+        double availHeight = double.PositiveInfinity;
+
+        if (NativeMethods.TryGetMonitorBounds(rect, out RECT monitor, out _))
+        {
+            availWidth = anchorRight ? rect.Right - monitor.Left : monitor.Right - rect.Left;
+            availHeight = anchorBottom ? rect.Bottom - monitor.Top : monitor.Bottom - rect.Top;
+
+            // 錨點邊本身就在螢幕外時不硬壓，交給 WM_WINDOWPOSCHANGING 收尾
+            availWidth = Math.Max(availWidth, minWidth);
+            availHeight = Math.Max(availHeight, minHeight);
+        }
+
+        double contentWidth = rect.Width - chromeX;
+        double contentHeight = rect.Height - chromeY;
+
+        if (_aspectRatio > 0)
+        {
+            if (drivenByHeight)
+            {
+                contentWidth = contentHeight * _aspectRatio;
+            }
+            else
+            {
+                contentHeight = contentWidth / _aspectRatio;
+            }
+
+            FitToLimits(
+                ref contentWidth, ref contentHeight,
+                minWidth - chromeX, minHeight - chromeY,
+                availWidth - chromeX, availHeight - chromeY);
+        }
+        else
+        {
+            // 還沒有畫面，只做尺寸與邊界箝制
+            contentWidth = Math.Clamp(contentWidth, minWidth - chromeX, availWidth - chromeX);
+            contentHeight = Math.Clamp(contentHeight, minHeight - chromeY, availHeight - chromeY);
+        }
+
+        int width = (int)Math.Round(contentWidth + chromeX);
+        int height = (int)Math.Round(contentHeight + chromeY);
+
+        if (anchorRight)
+        {
+            rect.Left = rect.Right - width;
+        }
+        else
+        {
+            rect.Right = rect.Left + width;
+        }
+
+        if (anchorBottom)
+        {
+            rect.Top = rect.Bottom - height;
+        }
+        else
+        {
+            rect.Bottom = rect.Top + height;
+        }
+
+        Marshal.StructureToPtr(rect, lParam, false);
+
+        handled = true;
+        return (IntPtr)1;
+    }
+
+    /// <summary>
+    /// 攔下所有移動與尺寸變更（拖曳、程式設定 Width／Height、DPI 切換），把視窗夾回螢幕內。
+    /// 這裡刻意不設 handled，只就地改寫 WINDOWPOS——WPF 自己也要靠這個訊息同步
+    /// Left／Top／Width／Height，攔掉的話屬性值會和實際位置對不上。
+    /// </summary>
+    private IntPtr HandleWindowPosChanging(IntPtr hwnd, IntPtr lParam, ref bool handled)
+    {
+        WINDOWPOS position = Marshal.PtrToStructure<WINDOWPOS>(lParam);
+
+        bool keepPosition = (position.flags & NativeMethods.SWP_NOMOVE) != 0;
+        bool keepSize = (position.flags & NativeMethods.SWP_NOSIZE) != 0;
+
+        if ((keepPosition && keepSize) || NativeMethods.IsIconic(hwnd))
+        {
+            return IntPtr.Zero;
+        }
+
+        if (!NativeMethods.GetWindowRect(hwnd, out RECT current))
+        {
+            return IntPtr.Zero;
+        }
+
+        // 訊息帶 SWP_NOMOVE／SWP_NOSIZE 時對應欄位是無效值，要拿目前的狀態補上
+        int x = keepPosition ? current.Left : position.x;
+        int y = keepPosition ? current.Top : position.y;
+        int width = keepSize ? current.Width : position.cx;
+        int height = keepSize ? current.Height : position.cy;
+
+        if (width <= 0 || height <= 0)
+        {
+            return IntPtr.Zero;
+        }
+
+        // 用「還沒夾過」的位置去找最近的螢幕，拖過兩台螢幕的中線時才換得過去
+        var proposed = new RECT { Left = x, Top = y, Right = x + width, Bottom = y + height };
+        if (!NativeMethods.TryGetMonitorBounds(proposed, out RECT monitor, out _))
+        {
+            return IntPtr.Zero;
+        }
+
+        // 尺寸一律重算，理由有兩個：一是不能大於螢幕，否則位置怎麼夾都會有一邊露在外面；
+        // 二是要擋掉 Aero Snap——把視窗甩到螢幕邊緣時系統會逕自把它拉成半螢幕或四分之一
+        // 螢幕，長寬比就毀了。作法是從比例正確的矩形出發，縮進「提議尺寸 ∩ 螢幕」之內。
+        DpiScale dpi = VisualTreeHelper.GetDpi(this);
+        double chromeX = ChromeThickness * dpi.DpiScaleX;
+        double chromeY = ChromeThickness * dpi.DpiScaleY;
+
+        double contentWidth = width - chromeX;
+        double contentHeight = height - chromeY;
+
+        if (_aspectRatio > 0)
+        {
+            // 一律由寬推高，寬度尊重外面給的值。不能反過來拿「提議的尺寸」當上限去
+            // 內縮——WPF 套用 Width／Height 的過程中會送出寬高還沒同時到位的中間訊息，
+            // 把比例正確的矩形塞進那種矩形裡會讓視窗一路縮小。
+            contentHeight = contentWidth / _aspectRatio;
+        }
+
+        FitToLimits(
+            ref contentWidth, ref contentHeight,
+            (MinEdgeLength * dpi.DpiScaleX) - chromeX,
+            (MinEdgeLength * dpi.DpiScaleY) - chromeY,
+            monitor.Width - chromeX, monitor.Height - chromeY);
+
+        int fittedWidth = (int)Math.Round(contentWidth + chromeX);
+        int fittedHeight = (int)Math.Round(contentHeight + chromeY);
+
+        // 差 1px 以內視為四捨五入誤差。不加這道門檻，縮放過程每一格都會被判定為
+        // 「尺寸有變」而反覆改寫，視窗會抖個不停。
+        if (Math.Abs(fittedWidth - width) > 1 || Math.Abs(fittedHeight - height) > 1)
+        {
+            width = fittedWidth;
+            height = fittedHeight;
+        }
+
+        // 不用 Math.Clamp：尺寸因四捨五入仍略大於螢幕時 min 會超過 max 而拋例外
+        x = Math.Max(monitor.Left, Math.Min(x, monitor.Right - width));
+        y = Math.Max(monitor.Top, Math.Min(y, monitor.Bottom - height));
+
+        bool moved = x != (keepPosition ? current.Left : position.x) ||
+                     y != (keepPosition ? current.Top : position.y);
+        bool resized = width != (keepSize ? current.Width : position.cx) ||
+                       height != (keepSize ? current.Height : position.cy);
+
+        if (!moved && !resized)
+        {
+            return IntPtr.Zero;
+        }
+
+        position.x = x;
+        position.y = y;
+        position.cx = width;
+        position.cy = height;
+
+        // 改了值就得把對應的「不要動」旗標拿掉，否則系統根本不會採用。
+        // 純尺寸變更（ApplyAspectRatio）造成的溢出就是靠這裡順便把位置移回來的。
+        if (moved)
+        {
+            position.flags &= ~NativeMethods.SWP_NOMOVE;
+        }
+
+        if (resized)
+        {
+            position.flags &= ~NativeMethods.SWP_NOSIZE;
+        }
+
+        Marshal.StructureToPtr(position, lParam, false);
+        return IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// 在保持長寬比的前提下等比縮放，讓尺寸同時滿足最小與最大限制。
+    /// 縮小刻意放在放大之後：螢幕比最小尺寸還小時以螢幕為準。
+    /// 單位由呼叫端決定（實體像素或 DIP），只要前後一致即可。
+    /// </summary>
+    private static void FitToLimits(
+        ref double width, ref double height,
+        double minWidth, double minHeight,
+        double maxWidth, double maxHeight)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        double grow = Math.Max(minWidth / width, minHeight / height);
+        if (grow > 1)
+        {
+            width *= grow;
+            height *= grow;
+        }
+
+        double shrink = Math.Min(maxWidth / width, maxHeight / height);
+        if (shrink < 1)
+        {
+            width *= shrink;
+            height *= shrink;
+        }
+    }
+
+    /// <summary>
+    /// 讓視窗形狀符合目標畫面的長寬比。刻意維持面積不變，
+    /// 目標從橫式變成直式時視窗才不會突然變得又細又長。
+    /// </summary>
+    private void ApplyAspectRatio(double ratio)
+    {
+        if (double.IsNaN(ratio) || double.IsInfinity(ratio) || ratio <= 0)
+        {
+            return;
+        }
+
+        // 比例幾乎沒變就不要動視窗，免得每次目標尺寸微調都跳一下
+        if (Math.Abs(ratio - _aspectRatio) < 0.001)
+        {
+            return;
+        }
+
+        _aspectRatio = ratio;
+
+        double contentWidth = Width - ChromeThickness;
+        double contentHeight = Height - ChromeThickness;
+
+        if (contentWidth <= 0 || contentHeight <= 0)
+        {
+            return;
+        }
+
+        double area = contentWidth * contentHeight;
+        contentWidth = Math.Sqrt(area * ratio);
+        contentHeight = contentWidth / ratio;
+
+        double maxWidth = double.PositiveInfinity;
+        double maxHeight = double.PositiveInfinity;
+
+        if (_handle != IntPtr.Zero &&
+            NativeMethods.GetWindowRect(_handle, out RECT bounds) &&
+            NativeMethods.TryGetMonitorBounds(bounds, out RECT monitor, out _))
+        {
+            DpiScale dpi = VisualTreeHelper.GetDpi(this);
+            maxWidth = (monitor.Width / dpi.DpiScaleX) - ChromeThickness;
+            maxHeight = (monitor.Height / dpi.DpiScaleY) - ChromeThickness;
+        }
+
+        FitToLimits(
+            ref contentWidth, ref contentHeight,
+            MinEdgeLength - ChromeThickness, MinEdgeLength - ChromeThickness,
+            maxWidth, maxHeight);
+
+        // 放大後可能超出螢幕右下角，位置由 HandleWindowPosChanging 收尾
+        Width = contentWidth + ChromeThickness;
+        Height = contentHeight + ChromeThickness;
+    }
+
+    /// <summary>
+    /// 取得目前所在螢幕的範圍，換算成 WPF 的 DIP 座標。
+    /// 位置一律透過 Left／Top 設定而不是 SetWindowPos——WPF 自己也在管這兩個屬性，
+    /// 繞過它直接搬 HWND 有時會被 WPF 的版面流程蓋回去。
+    /// </summary>
+    private bool TryGetMonitorBoundsInDips(out Rect monitorArea, out Rect workArea)
+    {
+        monitorArea = default;
+        workArea = default;
+
+        if (_handle == IntPtr.Zero ||
+            !NativeMethods.GetWindowRect(_handle, out RECT bounds) ||
+            !NativeMethods.TryGetMonitorBounds(bounds, out RECT monitor, out RECT work))
+        {
+            return false;
+        }
+
+        DpiScale dpi = VisualTreeHelper.GetDpi(this);
+        monitorArea = ToDips(monitor, dpi);
+        workArea = ToDips(work, dpi);
+        return true;
+    }
+
+    private static Rect ToDips(RECT rect, DpiScale dpi)
+    {
+        return new Rect(
+            rect.Left / dpi.DpiScaleX,
+            rect.Top / dpi.DpiScaleY,
+            rect.Width / dpi.DpiScaleX,
+            rect.Height / dpi.DpiScaleY);
+    }
+
     /// <summary>把視窗移到工作區右下角（WorkArea 已扣除工作列）。</summary>
     public void PositionAtBottomRight()
     {
-        Rect workArea = SystemParameters.WorkArea;
         const double margin = 16;
 
-        Left = workArea.Right - Width - margin;
-        Top = workArea.Bottom - Height - margin;
+        // 取不到螢幕資訊時退回主螢幕工作區
+        Rect area = TryGetMonitorBoundsInDips(out _, out Rect work) ? work : SystemParameters.WorkArea;
+
+        Left = area.Right - Width - margin;
+        Top = area.Bottom - Height - margin;
+    }
+
+    /// <summary>
+    /// 把視窗夾回螢幕內。尺寸變大時右下角可能被推出畫面，
+    /// 而純尺寸變更的 WM_WINDOWPOSCHANGING 不見得能順便修正位置，所以這裡再收一次尾。
+    /// </summary>
+    private void ClampPositionToMonitor()
+    {
+        if (double.IsNaN(Left) || double.IsNaN(Top) ||
+            !TryGetMonitorBoundsInDips(out Rect monitor, out _))
+        {
+            return;
+        }
+
+        // 不用 Math.Clamp：視窗比螢幕還大時 min 會超過 max 而拋例外
+        double x = Math.Max(monitor.Left, Math.Min(Left, monitor.Right - Width));
+        double y = Math.Max(monitor.Top, Math.Min(Top, monitor.Bottom - Height));
+
+        if (x != Left)
+        {
+            Left = x;
+        }
+
+        if (y != Top)
+        {
+            Top = y;
+        }
     }
 
     private void OnFrameCaptured(object? sender, FrameData frame)
@@ -262,6 +635,9 @@ public partial class MonitorWindow : Window
 
             // 換了尺寸，命中框的換算基準也跟著變
             _overlayResultId = -1;
+
+            // 這裡是唯一知道目標視窗尺寸的地方，順便讓視窗形狀跟上
+            ApplyAspectRatio(frame.Width / (double)frame.Height);
         }
 
         _bitmap.WritePixels(
