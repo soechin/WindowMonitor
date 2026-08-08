@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -22,6 +23,12 @@ public partial class MonitorWindow : Window
 {
     /// <summary>游標移入偵測與透明度過渡共用的輪詢間隔。</summary>
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(60);
+
+    /// <summary>
+    /// 每隔幾次輪詢重新宣告一次置頂（60 ms × 33 ≈ 2 秒）。
+    /// 不必每輪都做，被擠下去到使用者察覺之間本來就有數秒的緩衝。
+    /// </summary>
+    private const int TopmostRecheckTicks = 33;
 
     /// <summary>每次輪詢的不透明度變化量，用來讓淡入淡出看起來平順。</summary>
     private const double OpacityStep = 0.14;
@@ -63,6 +70,9 @@ public partial class MonitorWindow : Window
     private WriteableBitmap? _bitmap;
     private IntPtr _handle;
     private bool _isHovered;
+
+    /// <summary>距離下次重新宣告置頂還有幾次輪詢。</summary>
+    private int _topmostCountdown;
 
     /// <summary>目標畫面的寬高比（寬÷高）。0 代表還沒收到任何影格，此時不鎖比例。</summary>
     private double _aspectRatio;
@@ -117,6 +127,22 @@ public partial class MonitorWindow : Window
     public WindowPlacement GetPlacement()
     {
         return new WindowPlacement { Left = Left, Top = Top, Width = Width, Height = Height };
+    }
+
+    /// <summary>
+    /// 由主視窗設定，允許這個視窗真的被關閉。預設為 false——本視窗沒有標題列也不進工作列，
+    /// 一旦被 Alt+F4 之類的系統途徑關掉就再也叫不回來，因此平常一律擋下改成隱藏。
+    /// </summary>
+    public bool AllowClose { get; set; }
+
+    /// <summary>
+    /// 立刻用緩衝區裡的最新一幀重畫。重建視窗之後畫面本來要等下一次擷取才會出現
+    /// （<see cref="RenderLatestFrame"/> 只由 <see cref="OnFrameCaptured"/> 驅動），
+    /// 擷取已停止時甚至永遠等不到，所以給主視窗一個手動觸發的入口。
+    /// </summary>
+    public void RefreshFromLatestFrame()
+    {
+        RenderLatestFrame();
     }
 
     private static Brush CreateFrozenBrush(Color color)
@@ -177,10 +203,20 @@ public partial class MonitorWindow : Window
         base.OnSourceInitialized(e);
 
         _handle = new WindowInteropHelper(this).Handle;
+        HwndSource? hwndSource = HwndSource.FromHwnd(_handle);
 
         // AllowsTransparency="True" 之下 WPF 會接管命中測試，整個視窗都算 client 區，
         // 系統原本提供的邊緣縮放熱區會消失。這裡自己補回來。
-        HwndSource.FromHwnd(_handle)?.AddHook(WndProc);
+        hwndSource?.AddHook(WndProc);
+
+        // 這個視窗改走軟體轉譯。分層視窗（AllowsTransparency 的實作方式）在 GPU 驅動
+        // 重置、顯示模式切換或遠端桌面進出之後，硬體路徑有機會整個畫不出東西——視窗還在、
+        // 位置尺寸都正常，就是全透明，而且重畫也救不回來，只能重建視窗。軟體轉譯不依賴
+        // GPU 轉譯執行緒，吹不掉。代價可以忽略：這裡每秒只更新一張點陣圖。
+        if (hwndSource?.CompositionTarget is { } compositionTarget)
+        {
+            compositionTarget.RenderMode = RenderMode.SoftwareOnly;
+        }
 
         // 透明度套在 ContentLayer 而不是 Window.Opacity——後者作用於整個視窗的合成
         // 結果，會連警告紅框一起乘算掉（40% 視窗 × 閃爍波谷 0.2 幾乎看不見）。
@@ -193,7 +229,28 @@ public partial class MonitorWindow : Window
         ApplyClickThrough();
 
         ApplyRestorePlacement();
+        EnsureTopmost();
         _timer.Start();
+    }
+
+    /// <summary>
+    /// 重新把視窗宣告成置頂。XAML 的 Topmost="True" 只在建立時生效一次，之後被全螢幕程式、
+    /// 工作列或其他置頂視窗擠下去就再也回不來——本視窗又刻意不進工作列、開了點擊穿透時
+    /// 還帶 WS_EX_NOACTIVATE，使用者連點回來都做不到。因此改成週期性重新宣告。
+    ///
+    /// 同時帶 SWP_NOMOVE|SWP_NOSIZE，<see cref="HandleWindowPosChanging"/> 一開頭就會直接
+    /// 放行，位置、尺寸與長寬比鎖定完全不受影響；SWP_NOACTIVATE 則確保不會搶走焦點。
+    /// </summary>
+    public void EnsureTopmost()
+    {
+        if (_handle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        NativeMethods.SetWindowPos(
+            _handle, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0,
+            NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
     }
 
     /// <summary>
@@ -655,6 +712,12 @@ public partial class MonitorWindow : Window
         StepAlert();
         UpdateHoverState();
         StepOpacity();
+
+        if (--_topmostCountdown <= 0)
+        {
+            _topmostCountdown = TopmostRecheckTicks;
+            EnsureTopmost();
+        }
     }
 
     private void RenderLatestFrame()
@@ -888,6 +951,22 @@ public partial class MonitorWindow : Window
         catch (InvalidOperationException)
         {
             // 使用者放開按鍵的時機剛好卡在拖曳開始前，忽略即可
+        }
+    }
+
+    /// <summary>
+    /// 擋下非主視窗發起的關閉。這個視窗 WindowStyle="None" 但仍是貨真價實的最上層視窗，
+    /// 系統選單與 Alt+F4 都還在；被關掉之後主視窗不會知道，_monitor 仍指著死視窗，
+    /// 使用者只能重啟程式。因此改成隱藏，再由主視窗的「重建監控視窗」叫回來。
+    /// </summary>
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        base.OnClosing(e);
+
+        if (!AllowClose && !e.Cancel)
+        {
+            e.Cancel = true;
+            Hide();
         }
     }
 

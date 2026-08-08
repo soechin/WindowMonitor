@@ -87,6 +87,10 @@ internal static partial class NativeMethods
     // WINDOWPOS.flags
     public const int SWP_NOSIZE = 0x0001;
     public const int SWP_NOMOVE = 0x0002;
+    public const int SWP_NOACTIVATE = 0x0010;
+
+    // SetWindowPos 的 hWndInsertAfter
+    public static readonly IntPtr HWND_TOPMOST = new(-1);
 
     // MonitorFromRect
     public const int MONITOR_DEFAULTTONEAREST = 0x00000002;
@@ -132,6 +136,11 @@ internal static partial class NativeMethods
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool SetWindowPos(
+        IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, int uFlags);
 
     [LibraryImport("user32.dll")]
     public static partial IntPtr MonitorFromRect(ref RECT lprc, int dwFlags);

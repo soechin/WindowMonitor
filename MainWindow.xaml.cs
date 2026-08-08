@@ -185,13 +185,17 @@ public partial class MainWindow : Window
         ApplyNotificationOptions();
     }
 
-    private void ShowMonitorWindow()
+    /// <summary>
+    /// 建立並顯示監控視窗。<paramref name="placement"/> 為 null 時採用設定檔記錄的位置，
+    /// 重建時則由呼叫端把目前的位置傳進來，避免視窗跳回上次存檔的地方。
+    /// </summary>
+    private void ShowMonitorWindow(WindowPlacement? placement = null)
     {
         _monitor = new MonitorWindow(_source)
         {
             Owner = null,
             Matcher = _matcher,
-            RestorePlacement = _settings.MonitorPlacement,
+            RestorePlacement = placement ?? _settings.MonitorPlacement,
             ClickThrough = ClickThroughCheck.IsChecked == true,
             FadeOnHover = FadeOnHoverCheck.IsChecked == true,
             OpacityPercent = OpacityLevels[Math.Max(OpacityCombo.SelectedIndex, 0)],
@@ -407,7 +411,50 @@ public partial class MainWindow : Window
 
     private void OnResetPositionClick(object sender, RoutedEventArgs e)
     {
-        _monitor?.PositionAtBottomRight();
+        // 視窗可能已經被銷毀，此時 _monitor 仍是非 null 的死物件，直接呼叫會靜默無效
+        if (!IsMonitorAlive())
+        {
+            RecreateMonitorWindow();
+            return;
+        }
+
+        _monitor!.PositionAtBottomRight();
+        _monitor.EnsureTopmost();
+    }
+
+    private void OnRecreateMonitorClick(object sender, RoutedEventArgs e)
+    {
+        RecreateMonitorWindow();
+    }
+
+    private bool IsMonitorAlive()
+    {
+        return _monitor is not null &&
+               NativeMethods.IsWindow(new WindowInteropHelper(_monitor).Handle);
+    }
+
+    /// <summary>
+    /// 砍掉重建監控視窗。刻意不是 Show()＋重新置頂——分層視窗的合成表面一旦失效，
+    /// 顯示與重畫都救不回來，只有全新的 HWND 有用（這也正是「重啟程式有效、
+    /// 停止擷取再開始無效」的原因）。位置與大小照舊，使用者不必重新擺一次。
+    /// </summary>
+    private void RecreateMonitorWindow()
+    {
+        WindowPlacement? placement = IsMonitorAlive()
+            ? _monitor!.GetPlacement()
+            : _settings.MonitorPlacement;
+
+        if (_monitor is not null)
+        {
+            _monitor.AllowClose = true;
+            _monitor.Close();
+            _monitor = null;
+        }
+
+        ShowMonitorWindow(placement);
+
+        // 擷取停止時不會再有新影格，不主動畫一次的話新視窗會一直停在提示文字
+        _monitor?.RefreshFromLatestFrame();
     }
 
     // ── 樣板比對 ────────────────────────────────────────────
@@ -738,9 +785,14 @@ public partial class MainWindow : Window
         _source.FrameCaptured -= OnFrameCaptured;
         _notifier.StatusChanged -= OnNotifierStatusChanged;
 
-        // 先關監控視窗再釋放擷取資源，避免它還在讀已釋放的緩衝
-        _monitor?.Close();
-        _monitor = null;
+        // 先關監控視窗再釋放擷取資源，避免它還在讀已釋放的緩衝。
+        // AllowClose 是唯一能讓它真的關掉的途徑，否則 OnClosing 會攔下來改成隱藏。
+        if (_monitor is not null)
+        {
+            _monitor.AllowClose = true;
+            _monitor.Close();
+            _monitor = null;
+        }
 
         // 擷取先停下來，才不會有執行緒還在碰比對用的 Mat；
         // 停了之後也就不會再有 MatchCycleCompleted，通知才拆得乾淨
